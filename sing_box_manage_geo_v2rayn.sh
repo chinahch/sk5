@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# 检测系统类型
+# -------------------- 检测与安装 --------------------
 detect_os() {
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
@@ -10,7 +10,6 @@ detect_os() {
     fi
 }
 
-# 安装必要依赖
 install_dependencies() {
     OS=$(detect_os)
     case "$OS" in
@@ -21,7 +20,6 @@ install_dependencies() {
     esac
 }
 
-# 检测服务管理方式（systemd、openrc 或 fallback）
 detect_init_system() {
     if pidof systemd >/dev/null 2>&1; then
         echo "systemd"
@@ -32,7 +30,7 @@ detect_init_system() {
     fi
 }
 
-# 初始化 Sing-box（首次安装）
+# -------------------- 安装与初始化 --------------------
 install_singbox_if_needed() {
     if ! command -v sing-box >/dev/null 2>&1; then
         VERSION="1.11.5"
@@ -51,7 +49,6 @@ install_singbox_if_needed() {
     [[ ! -f /etc/sing-box/config.json ]] && echo '{"inbounds":[],"outbounds":[{"type":"direct"}],"route":{"rules":[]}}' > /etc/sing-box/config.json
 
     INIT_SYS=$(detect_init_system)
-
     if [[ "$INIT_SYS" == "systemd" ]]; then
         cat <<EOF > /etc/systemd/system/sing-box.service
 [Unit]
@@ -68,17 +65,8 @@ EOF
         systemctl daemon-reexec
         systemctl daemon-reload
         systemctl enable sing-box
-        
-if [[ "$INIT_SYS" == "systemd" ]]; then
-    systemctl start sing-box
-elif [[ "$INIT_SYS" == "openrc" ]]; then
-    rc-service sing-box start >/dev/null 2>&1
-else
-    echo "⚠️ 请手动启动 sing-box 或检查其运行状态"
-fi
-
+        systemctl start sing-box
         echo "✅ 使用 systemd 启动 Sing-box 服务"
-
     elif [[ "$INIT_SYS" == "openrc" ]]; then
         cat <<'EOF' > /etc/init.d/sing-box
 #!/sbin/openrc-run
@@ -94,33 +82,25 @@ EOF
         rc-update add sing-box default >/dev/null 2>&1
         rc-service sing-box start >/dev/null 2>&1
         echo "✅ 使用 OpenRC 启动 Sing-box 服务"
-
     else
-        echo "⚠️ 未检测到受支持的服务管理系统，采用后台运行方式"
         nohup /usr/local/bin/sing-box run -c /etc/sing-box/config.json >/var/log/sing-box.log 2>&1 &
         echo "✅ Sing-box 已使用 nohup 在后台运行"
     fi
 }
 
-# 快捷命令 sk
-
+# -------------------- 快捷方式 --------------------
 setup_shortcut() {
-    MAIN_CMD="/usr/local/bin/sk"
-    ALT_CMD="/usr/local/bin/ck"
-    SCRIPT_PATH="$(realpath "$0")"
+    CMD_DIR="/usr/local/bin"
+    SCRIPT_REAL_PATH="$(realpath "$0")"
 
-    # sk 快捷方式（默认全功能：含 init）
-    [[ -f "$MAIN_CMD" ]] || echo -e "#!/bin/bash
-bash \"$SCRIPT_PATH\" --init" > "$MAIN_CMD" && chmod +x "$MAIN_CMD"
+    echo -e "#!/bin/bash\nbash \"$SCRIPT_REAL_PATH\" --init" > "${CMD_DIR}/sk"
+    chmod +x "${CMD_DIR}/sk"
 
-    # ck 快捷方式（仅进入菜单）
-    [[ -f "$ALT_CMD" ]] || echo -e "#!/bin/bash
-bash \"$SCRIPT_PATH\"" > "$ALT_CMD" && chmod +x "$ALT_CMD"
+    echo -e "#!/bin/bash\nbash \"$SCRIPT_REAL_PATH\"" > "${CMD_DIR}/ck"
+    chmod +x "${CMD_DIR}/ck"
 }
 
-
-
-# 重启 sing-box 服务
+# -------------------- 服务重启 --------------------
 restart_singbox() {
     INIT_SYS=$(detect_init_system)
     if [[ "$INIT_SYS" == "systemd" ]]; then
@@ -134,8 +114,59 @@ restart_singbox() {
     fi
 }
 
+# -------------------- 卸载（含子选项） --------------------
+uninstall_singbox() {
+    echo ""
+    echo "=========== 卸载选项 ==========="
+    echo "1) 卸载 Sing-box 服务与配置"
+    echo "2) 完全卸载（包括脚本与快捷方式）"
+    echo "9) 返回主菜单"
+    echo "================================"
+    read -p "请输入操作编号: " SUB_CHOICE
 
-# 获取版本架构信息
+    case "$SUB_CHOICE" in
+        1)
+            echo "⚠️ 即将卸载 Sing-box 服务及配置..."
+            read -p "是否确认卸载？(y/n): " CONFIRM
+            [[ "$CONFIRM" != "y" ]] && echo "❌ 已取消卸载" && return
+
+            INIT_SYS=$(detect_init_system)
+            if [[ "$INIT_SYS" == "systemd" ]]; then
+                systemctl stop sing-box
+                systemctl disable sing-box
+                rm -f /etc/systemd/system/sing-box.service
+                systemctl daemon-reload
+            elif [[ "$INIT_SYS" == "openrc" ]]; then
+                rc-service sing-box stop >/dev/null 2>&1
+                rc-update del sing-box default >/dev/null 2>&1
+                rm -f /etc/init.d/sing-box
+            fi
+
+            pkill -f "sing-box" 2>/dev/null
+            rm -rf /usr/local/bin/sing-box
+            rm -rf /etc/sing-box
+            echo "✅ Sing-box 服务与配置已卸载完成"
+            ;;
+        2)
+            echo "⚠️ 即将执行完整卸载（包括脚本本身）..."
+            read -p "是否确认彻底卸载所有组件？(y/n): " CONFIRM2
+            [[ "$CONFIRM2" != "y" ]] && echo "❌ 已取消" && return
+
+            # 调用第一步
+            $0 --uninstall-core
+
+            rm -f /usr/local/bin/sk /usr/local/bin/ck
+            rm -f "$0"
+
+            echo "✅ 所有组件已完全卸载（包括当前脚本）"
+            exit 0
+            ;;
+        9) return ;;
+        *) echo "❌ 无效输入" ;;
+    esac
+}
+
+# -------------------- 工具函数 --------------------
 show_version_info() {
     if command -v sing-box >/dev/null 2>&1; then
         VER=$(sing-box version | grep 'sing-box version' | awk '{print $3}')
@@ -146,23 +177,20 @@ show_version_info() {
     fi
 }
 
-# 延迟检测
 show_latency() {
     LAT=$(ping -c 3 -W 1 baidu.com 2>/dev/null | awk -F '/' 'END { print $5 }')
     [[ -z "$LAT" ]] && echo "到百度延迟: 不可达" || echo "到百度延迟: $LAT ms"
 }
 
-# 获取国家缩写
 get_country_code() {
     curl -s --max-time 2 https://ipapi.co/country/ || echo "ZZ"
 }
 
-# 获取 IPv6
 get_ipv6_address() {
     ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -n1
 }
 
-# 添加节点
+# -------------------- 节点管理 --------------------
 add_node() {
     read -p "请输入端口号（留空随机）: " PORT
     [[ -z "$PORT" ]] && PORT=$((RANDOM % 10000 + 40000))
@@ -170,7 +198,6 @@ add_node() {
     USER=${USER:-user}
     read -p "请输入密码（默认 pass123）: " PASS
     PASS=${PASS:-pass123}
-
     TAG="sk5-$(get_country_code)"
     CONFIG="/etc/sing-box/config.json"
 
@@ -183,29 +210,16 @@ add_node() {
         "users": [{"username": $user, "password": $pass}]
     }]' "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
 
-    
-INIT_SYS=$(detect_init_system)
-if [[ "$INIT_SYS" == "systemd" ]]; then
-    systemctl restart sing-box
-elif [[ "$INIT_SYS" == "openrc" ]]; then
-    rc-service sing-box restart >/dev/null 2>&1
-else
-    echo "⚠️ 请手动重启 sing-box 或检查其运行状态"
-fi
-
+    restart_singbox
 
     ENCODED=$(echo -n "$USER:$PASS" | base64)
     IPV4=$(curl -s --max-time 2 https://api.ipify.org)
     IPV6=$(get_ipv6_address)
-
-    echo "节点已添加："
     echo "端口: $PORT | 用户名: $USER | 密码: $PASS"
-    echo "节点名: $TAG"
     echo "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#$TAG"
     echo "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#$TAG"
 }
 
-# 查看节点
 view_nodes() {
     jq -c '.inbounds[]' /etc/sing-box/config.json | nl -w2 -s'. ' | while read -r line; do
         INDEX=$(echo "$line" | cut -d. -f1)
@@ -224,7 +238,6 @@ view_nodes() {
     done
 }
 
-# 删除节点
 delete_node() {
     CONFIG="/etc/sing-box/config.json"
     COUNT=$(jq '.inbounds | length' "$CONFIG")
@@ -236,7 +249,7 @@ delete_node() {
     echo "已删除节点 [$((IDX + 1))]（无需重启）"
 }
 
-# 自动更新 Sing-box
+# -------------------- 更新功能 --------------------
 update_singbox() {
     CUR=$(sing-box version 2>/dev/null | grep version | awk '{print $3}')
     LATEST=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | head -n1 | sed -E 's/.*"v([^"]+)".*/\1/')
@@ -256,37 +269,16 @@ update_singbox() {
     curl -LO https://github.com/SagerNet/sing-box/releases/download/v${LATEST}/sing-box-${LATEST}-linux-${ARCH}.tar.gz
     tar -xvzf sing-box-${LATEST}-linux-${ARCH}.tar.gz
 
-    echo "正在停止 sing-box 服务以完成更新..."
-    
-INIT_SYS=$(detect_init_system)
-if [[ "$INIT_SYS" == "systemd" ]]; then
-    systemctl stop sing-box
-elif [[ "$INIT_SYS" == "openrc" ]]; then
-    rc-service sing-box stop >/dev/null 2>&1
-else
-    echo "⚠️ 请手动停止 sing-box 或检查其运行状态"
-fi
-
-
+    restart_singbox stop
     cp sing-box-${LATEST}-linux-${ARCH}/sing-box /usr/local/bin/
     chmod +x /usr/local/bin/sing-box
-
-    echo "已更新至 v$LATEST，正在重启服务..."
-    
-if [[ "$INIT_SYS" == "systemd" ]]; then
-    systemctl start sing-box
-elif [[ "$INIT_SYS" == "openrc" ]]; then
-    rc-service sing-box start >/dev/null 2>&1
-else
-    echo "⚠️ 请手动启动 sing-box 或检查其运行状态"
-fi
-
+    restart_singbox
 
     echo "更新完成为 v$LATEST"
     cd && rm -rf "$TMP"
 }
 
-# 主菜单
+# -------------------- 主菜单 --------------------
 main_menu() {
     echo ""
     show_latency
@@ -297,6 +289,7 @@ main_menu() {
     echo "3) 删除用户（通过序号）"
     echo "4) 检查并更新 Sing-box 到最新版"
     echo "5) 重启 Sing-box 服务"
+    echo "6) 卸载 Sing-box"
     echo "9) 退出"
     echo "==============================================================="
     read -p "请输入操作编号: " CHOICE
@@ -306,12 +299,13 @@ main_menu() {
         3) delete_node ;;
         4) update_singbox ;;
         5) restart_singbox ;;
+        6) uninstall_singbox ;;
         9) exit 0 ;;
         *) echo "无效输入" ;;
     esac
 }
 
-# 启动逻辑
+# -------------------- 启动流程 --------------------
 install_dependencies
 install_singbox_if_needed
 setup_shortcut
