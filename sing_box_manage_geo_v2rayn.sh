@@ -10,14 +10,21 @@ detect_os() {
     fi
 }
 
-# 安装必要依赖
+# 安装必要依赖（仅在缺失时安装）
 install_dependencies() {
+    if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        echo "✅ curl 和 jq 已安装，跳过安装步骤"
+        return
+    fi
+
     OS=$(detect_os)
     case "$OS" in
-        alpine) apk add --no-cache curl jq bash ;;
+        alpine) apk add --no-cache curl jq ;;
         debian|ubuntu) apt update && apt install -y curl jq ;;
         centos|rhel|fedora) yum install -y curl jq ;;
-        *) echo "请手动安装 curl 和 jq" ;;
+        *)
+            echo "⚠️ 未识别系统，请手动安装 curl 和 jq"
+            ;;
     esac
 }
 
