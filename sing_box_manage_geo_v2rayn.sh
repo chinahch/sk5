@@ -122,6 +122,32 @@ bash \"$SCRIPT_PATH\"" > "$ALT_CMD" && chmod +x "$ALT_CMD"
 
 # 重启 sing-box 服务
 restart_singbox() {
+    echo "⚠️ 将卸载 sing-box 并重新安装..."
+
+    INIT_SYS=$(detect_init_system)
+
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        systemctl stop sing-box
+        systemctl disable sing-box
+        rm -f /etc/systemd/system/sing-box.service
+    elif [[ "$INIT_SYS" == "openrc" ]]; then
+        rc-service sing-box stop
+        rc-update del sing-box default
+        rm -f /etc/init.d/sing-box
+    fi
+
+    rm -f /usr/local/bin/sing-box
+    rm -rf /etc/sing-box
+    rm -f /usr/local/bin/sk /usr/local/bin/ck
+
+    echo "✅ 已完成卸载，正在重新安装..."
+    sleep 2
+
+    install_singbox_if_needed
+    setup_shortcut
+
+    echo "✅ 修复完成，Sing-box 已重新安装并启动"
+}
     INIT_SYS=$(detect_init_system)
     if [[ "$INIT_SYS" == "systemd" ]]; then
         systemctl restart sing-box
@@ -297,6 +323,7 @@ main_menu() {
     echo "3) 删除用户（通过序号）"
     echo "4) 检查并更新 Sing-box 到最新版"
     echo "5) 重启 Sing-box 服务"
+	echo "6) 修复 Sing-box（卸载并重装）"
     echo "9) 退出"
     echo "==============================================================="
     read -p "请输入操作编号: " CHOICE
@@ -306,6 +333,7 @@ main_menu() {
         3) delete_node ;;
         4) update_singbox ;;
         5) restart_singbox ;;
+		6) repair_singbox ;;
         9) exit 0 ;;
         *) echo "无效输入" ;;
     esac
