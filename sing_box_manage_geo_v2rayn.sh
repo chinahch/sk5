@@ -63,24 +63,25 @@ install_singbox_if_needed() {
     echo "⚠️ 未检测到 Sing-box，正在安装..."
 
     VERSION="1.12.0"
-ARCH=$(uname -m)
-[[ "$ARCH" == "x86_64" ]] && ARCH="amd64"
-[[ "$ARCH" == "aarch64" ]] && ARCH="arm64"
+    ARCH=$(uname -m)
+    [[ "$ARCH" == "x86_64" ]] && ARCH="amd64"
+    [[ "$ARCH" == "aarch64" ]] && ARCH="arm64"
 
-TMP=$(mktemp -d)
-cd "$TMP" || exit
+    TMP=$(mktemp -d)
+    cd "$TMP" || exit
 
-echo "⬇️ 正在下载 Sing-box v$VERSION for $ARCH..."
-curl -LO https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${ARCH}.tar.gz
+    echo "⬇️ 正在下载 Sing-box v$VERSION for $ARCH..."
+    curl -LO https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${ARCH}.tar.gz
 
-echo "📦 解压中..."
-tar -xvzf sing-box-${VERSION}-linux-${ARCH}.tar.gz
+    echo "📦 解压中..."
+    tar -xvzf sing-box-${VERSION}-linux-${ARCH}.tar.gz
 
-echo "⚙️ 安装中..."
-cp sing-box-${VERSION}-linux-${ARCH}/sing-box /usr/local/bin/
-chmod +x /usr/local/bin/sing-box
+    echo "⚙️ 安装中..."
+    cp sing-box-${VERSION}-linux-${ARCH}/sing-box /usr/local/bin/
+    chmod +x /usr/local/bin/sing-box
 
-cd && rm -rf "$TMP"
+    echo "✅ Sing-box 已成功安装到 /usr/local/bin/sing-box"
+    cd && rm -rf "$TMP"
 
     mkdir -p /etc/sing-box
     [[ ! -f /etc/sing-box/config.json ]] && echo '{"inbounds":[],"outbounds":[{"type":"direct"}],"route":{"rules":[]}}' > /etc/sing-box/config.json
@@ -163,101 +164,50 @@ restart_singbox() {
 }
 
 
-# ✅ 修复 Sing-box（增强版：初始化重装 / 完全卸载 + 输入校验）
+# ✅ 修复 Sing-box 功能（增强为可选完全卸载/保留配置）
 repair_singbox() {
-    while true; do
-        echo ""
-        echo "=== Sing-box（完全卸载--初始化重装） ==="
-        echo "0) 返回主菜单"
-        echo "1) 全部删除并初始化安装"
-        echo "2) 完全卸载"
-        read -p "请输入操作编号（默认 1）: " SUBCHOICE
-        SUBCHOICE=${SUBCHOICE:-1}
+    echo ""
+    echo "=== Sing-box（完全卸载--初始化重装） ==="
+    echo "0) 返回主菜单"
+    echo "1) 保留节点配置重新安装"
+    echo "2) 全部删除并初始化安装"
+    read -p "请输入操作编号（默认 1）: " SUBCHOICE
+    SUBCHOICE=${SUBCHOICE:-1}
 
-        case "$SUBCHOICE" in
-            0)
-                echo "🔙 返回主菜单..."
-                return
-                ;;
-            1)
-                INIT_SYS=$(detect_init_system)
+    if [[ "$SUBCHOICE" == "0" ]]; then
+        echo "🔙 返回主菜单..."
+        return
+    fi
 
-                echo "⚠️ 停止并清理旧服务..."
-                if [[ "$INIT_SYS" == "systemd" ]]; then
-                    systemctl stop sing-box
-                    systemctl disable sing-box
-                    rm -f /etc/systemd/system/sing-box.service
-                elif [[ "$INIT_SYS" == "openrc" ]]; then
-                    rc-service sing-box stop
-                    rc-update del sing-box default
-                    rm -f /etc/init.d/sing-box
-                fi
+    INIT_SYS=$(detect_init_system)
 
-                echo "🧹 清除文件..."
-                rm -f /usr/local/bin/sing-box
-                rm -f /usr/local/bin/sk /usr/local/bin/ck
-                rm -rf /etc/sing-box
+    echo "⚠️ 停止并清理旧服务..."
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        systemctl stop sing-box
+        systemctl disable sing-box
+        rm -f /etc/systemd/system/sing-box.service
+    elif [[ "$INIT_SYS" == "openrc" ]]; then
+        rc-service sing-box stop
+        rc-update del sing-box default
+        rm -f /etc/init.d/sing-box
+    fi
 
-                echo "📦 开始重新安装 Sing-box..."
-                VERSION="1.12.0"
-                ARCH=$(uname -m)
-                [[ "$ARCH" == "x86_64" ]] && ARCH="amd64"
-                [[ "$ARCH" == "aarch64" ]] && ARCH="arm64"
+    echo "⚠️ 正在卸载 Sing-box 可执行文件..."
+    rm -f /usr/local/bin/sing-box
+    rm -f /usr/local/bin/sk /usr/local/bin/ck
 
-                TMP=$(mktemp -d)
-                cd "$TMP" || exit
+    if [[ "$SUBCHOICE" == "2" ]]; then
+        echo "⚠️ 删除配置文件和所有节点信息..."
+        rm -rf /etc/sing-box
+    else
+        echo "✅ 保留 /etc/sing-box/config.json 配置文件"
+    fi
 
-                echo "⬇️ 下载 Sing-box v$VERSION..."
-                curl -LO https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${ARCH}.tar.gz
-                tar -xvzf sing-box-${VERSION}-linux-${ARCH}.tar.gz
-
-                echo "⚙️ 安装中..."
-                cp sing-box-${VERSION}-linux-${ARCH}/sing-box /usr/local/bin/
-                chmod +x /usr/local/bin/sing-box
-                cd && rm -rf "$TMP"
-
-                setup_shortcut
-                install_singbox_if_needed
-
-                echo "✅ Sing-box 已重新安装并启动"
-                return
-                ;;
-            2)
-                INIT_SYS=$(detect_init_system)
-
-                echo "⚠️ 停止并清理旧服务..."
-                if [[ "$INIT_SYS" == "systemd" ]]; then
-                    systemctl stop sing-box
-                    systemctl disable sing-box
-                    rm -f /etc/systemd/system/sing-box.service
-                elif [[ "$INIT_SYS" == "openrc" ]]; then
-                    rc-service sing-box stop
-                    rc-update del sing-box default
-                    rm -f /etc/init.d/sing-box
-                fi
-
-                echo "🧹 清除文件..."
-                rm -f /usr/local/bin/sing-box
-                rm -f /usr/local/bin/sk /usr/local/bin/ck
-                rm -rf /etc/sing-box
-
-                SCRIPT_PATH=$(realpath "$0")
-                echo "🧹 删除脚本：$SCRIPT_PATH"
-                echo ""
-                echo "✅ Sing-box 及相关文件已完全卸载"
-                echo ""
-                echo "👋 欢迎再次使用本脚本安装："
-                echo "bash <(curl -Ls https://raw.githubusercontent.com/chinahch/sk5/refs/heads/main/install.sh)"
-                echo ""
-
-                rm -f "$SCRIPT_PATH"
-                exit 0
-                ;;
-            *)
-                echo "❌ 无效输入，请输入 0 / 1 / 2"
-                ;;
-        esac
-    done
+    echo "📦 开始重新安装 Sing-box..."
+    sleep 2
+    install_singbox_if_needed
+    setup_shortcut
+    echo "✅ 重装完成，Sing-box 已重新部署并启动"
 }
 
 
@@ -302,149 +252,158 @@ get_ipv6_address() {
 
 # 添加节点
 add_node() {
+    echo "请选择协议类型："
+    echo "1) SOCKS5"
+    echo "2) VLESS-REALITY"
+    read -p "输入协议编号（默认 1）: " PROTO
+    PROTO=${PROTO:-1}
+
     CONFIG="/etc/sing-box/config.json"
 
-    while true; do
-        echo "请选择协议类型："
-        echo "1) SOCKS5"
-        echo "2) VLESS-REALITY"
-        read -p "输入协议编号（默认 1）: " PROTO
-        PROTO=${PROTO:-1}
+    if [[ "$PROTO" == "2" ]]; then
+        # === 添加 VLESS + REALITY (TCP + Vision Flow) 节点 ===
+        read -p "请输入端口号（默认 443）: " PORT
+        PORT=${PORT:-443}
 
-        case "$PROTO" in
-            1)
-                # === 添加 SOCKS5 节点 ===
-                read -p "请输入端口号（留空随机）: " PORT
-                [[ -z "$PORT" ]] && PORT=$((RANDOM % 10000 + 40000))
-                read -p "请输入用户名（默认 user）: " USER
-                USER=${USER:-user}
-                read -p "请输入密码（默认 pass123）: " PASS
-                PASS=${PASS:-pass123}
-                TAG="sk5-$(get_country_code)"
+        # 自动生成 UUID
+        if command -v uuidgen >/dev/null 2>&1; then
+            UUID=$(uuidgen)
+        else
+            UUID=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/')
+        fi
 
-                jq --arg port "$PORT" --arg user "$USER" --arg pass "$PASS" --arg tag "$TAG" \
-                '.inbounds += [{
-                    "type": "socks",
-                    "tag": $tag,
-                    "listen": "0.0.0.0",
-                    "listen_port": ($port|tonumber),
-                    "users": [{"username": $user, "password": $pass}]
-                }]' "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
+        # Reality 配置默认值
+        SNI_POOL=("www.cloudflare.com" "www.google.com" "www.yahoo.com" "www.microsoft.com" "www.amazon.com" "www.bing.com")
+FINGERPRINT_POOL=("chrome" "firefox" "safari" "ios" "android")
 
-                echo ""
-                echo "🧪 正在校验配置文件..."
-                if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
-                    echo "✅ 配置校验通过，正在重启 Sing-box 服务..."
-                    restart_singbox
-                else
-                    echo "❌ 配置校验失败，Sing-box 未重启。请检查配置："
-                    sing-box check -c "$CONFIG"
-                    echo ""
-                    echo "提示：你可以手动修复 /etc/sing-box/config.json 后运行："
-                    echo "systemctl restart sing-box"
-                    return 1
-                fi
+SERVER_NAME=${SNI_POOL[$RANDOM % ${#SNI_POOL[@]}]}
+FINGERPRINT=${FINGERPRINT_POOL[$RANDOM % ${#FINGERPRINT_POOL[@]}]}
 
-                ENCODED=$(echo -n "$USER:$PASS" | base64)
-                IPV4=$(curl -s --max-time 2 https://api.ipify.org)
-                IPV6=$(get_ipv6_address)
+        FLOW="xtls-rprx-vision"
+        TAG="vless-reality-$(get_country_code)"
 
-                echo "✅ SOCKS5 节点已添加："
-                echo "端口: $PORT | 用户名: $USER | 密码: $PASS"
-                echo "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#$TAG"
-                echo "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#$TAG"
-                return
-                ;;
-            2)
-                # === 添加 VLESS + REALITY 节点 ===
-                read -p "请输入端口号（默认 443）: " PORT
-                PORT=${PORT:-443}
+        # 生成公私钥
+        KEY_PAIR=$(sing-box generate reality-keypair 2>/dev/null)
+        PRIVATE_KEY=$(echo "$KEY_PAIR" | grep 'PrivateKey' | awk '{print $2}')
+        PUBLIC_KEY=$(echo "$KEY_PAIR" | grep 'PublicKey' | awk '{print $2}')
 
-                UUID=$(uuidgen)
-                SNI_POOL=("www.cloudflare.com" "www.google.com" "www.yahoo.com" "www.microsoft.com" "www.amazon.com" "www.bing.com")
-                FINGERPRINT_POOL=("chrome" "firefox" "safari" "ios" "android")
-                SERVER_NAME=${SNI_POOL[$RANDOM % ${#SNI_POOL[@]}]}
-                FINGERPRINT=${FINGERPRINT_POOL[$RANDOM % ${#FINGERPRINT_POOL[@]}]}
-                FLOW="xtls-rprx-vision"
-                TAG="vless-reality-$(get_country_code)"
+        if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+            echo "❌ 无法生成 Reality 密钥对，请确认 sing-box 支持 reality-keypair 命令"
+            return 1
+        fi
 
-                KEY_PAIR=$(sing-box generate reality-keypair 2>/dev/null)
-                PRIVATE_KEY=$(echo "$KEY_PAIR" | grep 'PrivateKey' | awk '{print $2}')
-                PUBLIC_KEY=$(echo "$KEY_PAIR" | grep 'PublicKey' | awk '{print $2}')
-                [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]] && echo "❌ Reality 密钥生成失败" && return 1
-                SHORT_ID=$(openssl rand -hex 8)
+        SHORT_ID=$(openssl rand -hex 8)
 
-                jq --arg port "$PORT" \
-                   --arg uuid "$UUID" \
-                   --arg prikey "$PRIVATE_KEY" \
-                   --arg sid "$SHORT_ID" \
-                   --arg server "$SERVER_NAME" \
-                   --arg fp "$FINGERPRINT" \
-                   --arg flow "$FLOW" \
-                   --arg tag "$TAG" \
-                '
-                .inbounds += [{
-                    "type": "vless",
-                    "tag": $tag,
-                    "listen": "0.0.0.0",
-                    "listen_port": ($port | tonumber),
-                    "users": [{ "uuid": $uuid, "flow": $flow }],
-                    "tls": {
-                        "enabled": true,
-                        "server_name": $server,
-                        "reality": {
-                            "enabled": true,
-                            "handshake": {
-                                "server": $server,
-                                "server_port": 443
-                            },
-                            "private_key": $prikey,
-                            "short_id": [$sid]
-                        }
-                    }
-                }]
-                ' "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
+        # 写入配置
+        jq --arg port "$PORT" \
+   --arg uuid "$UUID" \
+   --arg prikey "$PRIVATE_KEY" \
+   --arg sid "$SHORT_ID" \
+   --arg server "$SERVER_NAME" \
+   --arg fp "$FINGERPRINT" \
+   --arg flow "$FLOW" \
+   --arg tag "$TAG" \
+   '
+   .inbounds += [{
+       "type": "vless",
+       "tag": $tag,
+       "listen": "0.0.0.0",
+       "listen_port": ($port | tonumber),
+       "users": [{ "uuid": $uuid, "flow": $flow }],
+       "tls": {
+           "enabled": true,
+           "server_name": $server,
+           "reality": {
+               "enabled": true,
+               "handshake": {
+                   "server": $server,
+                   "server_port": 443
+               },
+               "private_key": $prikey,
+               "short_id": [$sid]
+           }
+       }
+   }]
+   ' "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
 
-                echo ""
-                echo "🧪 正在校验配置文件..."
-                if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
-                    echo "✅ 配置校验通过，正在重启 Sing-box 服务..."
-                    restart_singbox
-                else
-                    echo "❌ 配置校验失败，Sing-box 未重启。请检查配置："
-                    sing-box check -c "$CONFIG"
-                    echo ""
-                    echo "提示：你可以手动修复 /etc/sing-box/config.json 后运行："
-                    echo "systemctl restart sing-box"
-                    return 1
-                fi
 
-                IPV4=$(curl -s --max-time 2 https://api.ipify.org)
-                VLESS_LINK="vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FINGERPRINT}#${TAG}"
+        # ✅ 校验配置后再重启
+        echo ""
+        echo "🧪 正在校验配置文件..."
+        if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
+            echo "✅ 配置校验通过，正在重启 Sing-box 服务..."
+            restart_singbox
+        else
+            echo "❌ 配置校验失败，Sing-box 未重启。请检查配置："
+            sing-box check -c "$CONFIG"
+            echo ""
+            echo "提示：你可以手动修复 /etc/sing-box/config.json 后运行："
+            echo "systemctl restart sing-box"
+            return 1
+        fi
 
-                echo ""
-                echo "✅ VLESS + REALITY 节点已添加："
-                echo "端口: $PORT"
-                echo "UUID: $UUID"
-                echo "Reality 公钥: $PUBLIC_KEY"
-                echo "Reality 私钥: $PRIVATE_KEY"
-                echo "Short ID: $SHORT_ID"
-                echo "SNI: $SERVER_NAME"
-                echo "Fingerprint: $FINGERPRINT"
-                echo "TAG: $TAG"
-                echo ""
-                echo "👉 v2rayN 节点链接（可复制导入）:"
-                echo "$VLESS_LINK"
-                echo ""
-                return
-                ;;
-            *)
-                echo "❌ 无效输入，请重新选择 1 或 2"
-                ;;
-        esac
-    done
+        # 构建链接
+        IPV4=$(curl -s --max-time 2 https://api.ipify.org)
+        VLESS_LINK="vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FINGERPRINT}#${TAG}"
+
+        echo ""
+        echo "✅ VLESS + REALITY 节点已添加："
+        echo "端口: $PORT"
+        echo "UUID: $UUID"
+        echo "Reality 公钥: $PUBLIC_KEY"
+        echo "Reality 私钥: $PRIVATE_KEY"
+        echo "Short ID: $SHORT_ID"
+        echo "SNI: $SERVER_NAME"
+        echo "Fingerprint: $FINGERPRINT"
+        echo "TAG: $TAG"
+        echo ""
+        echo "👉 v2rayN 节点链接（可复制导入）:"
+        echo "$VLESS_LINK"
+        echo ""
+
+    else
+        # === 添加 SOCKS5 节点 ===
+        read -p "请输入端口号（留空随机）: " PORT
+        [[ -z "$PORT" ]] && PORT=$((RANDOM % 10000 + 40000))
+        read -p "请输入用户名（默认 user）: " USER
+        USER=${USER:-user}
+        read -p "请输入密码（默认 pass123）: " PASS
+        PASS=${PASS:-pass123}
+        TAG="sk5-$(get_country_code)"
+
+        jq --arg port "$PORT" --arg user "$USER" --arg pass "$PASS" --arg tag "$TAG" \
+        '.inbounds += [{
+            "type": "socks",
+            "tag": $tag,
+            "listen": "0.0.0.0",
+            "listen_port": ($port|tonumber),
+            "users": [{"username": $user, "password": $pass}]
+        }]' "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
+
+        echo ""
+        echo "🧪 正在校验配置文件..."
+        if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
+            echo "✅ 配置校验通过，正在重启 Sing-box 服务..."
+            restart_singbox
+        else
+            echo "❌ 配置校验失败，Sing-box 未重启。请检查配置："
+            sing-box check -c "$CONFIG"
+            echo ""
+            echo "提示：你可以手动修复 /etc/sing-box/config.json 后运行："
+            echo "systemctl restart sing-box"
+            return 1
+        fi
+
+        ENCODED=$(echo -n "$USER:$PASS" | base64)
+        IPV4=$(curl -s --max-time 2 https://api.ipify.org)
+        IPV6=$(get_ipv6_address)
+
+        echo "✅ SOCKS5 节点已添加："
+        echo "端口: $PORT | 用户名: $USER | 密码: $PASS"
+        echo "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#$TAG"
+        echo "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#$TAG"
+    fi
 }
-
 
 
 # 查看节点
@@ -591,4 +550,3 @@ install_dependencies
 install_singbox_if_needed
 setup_shortcut
 while true; do main_menu; done
-
