@@ -249,8 +249,12 @@ add_node() {
         fi
 
         # Reality 配置默认值
-        SERVER_NAME="aws.amazon.com"
-        FINGERPRINT="chrome"
+        SNI_POOL=("www.cloudflare.com" "www.google.com" "www.yahoo.com" "www.microsoft.com" "www.amazon.com" "www.bing.com")
+FINGERPRINT_POOL=("chrome" "firefox" "safari" "ios" "android")
+
+SERVER_NAME=${SNI_POOL[$RANDOM % ${#SNI_POOL[@]}]}
+FINGERPRINT=${FINGERPRINT_POOL[$RANDOM % ${#FINGERPRINT_POOL[@]}]}
+
         FLOW="xtls-rprx-vision"
         TAG="vless-reality-$(get_country_code)"
 
@@ -269,20 +273,22 @@ add_node() {
         # 写入配置
         jq --arg port "$PORT" \
    --arg uuid "$UUID" \
-   --arg pubkey "$PUBLIC_KEY" \
    --arg prikey "$PRIVATE_KEY" \
    --arg sid "$SHORT_ID" \
    --arg server "$SERVER_NAME" \
+   --arg fp "$FINGERPRINT" \
+   --arg flow "$FLOW" \
    --arg tag "$TAG" \
    '
    .inbounds += [{
        "type": "vless",
        "tag": $tag,
-       "listen": "::",
-       "listen_port": ($port|tonumber),
-       "users": [{ "uuid": $uuid }],
+       "listen": "0.0.0.0",
+       "listen_port": ($port | tonumber),
+       "users": [{ "uuid": $uuid, "flow": $flow }],
        "tls": {
            "enabled": true,
+           "server_name": $server,
            "reality": {
                "enabled": true,
                "handshake": {
@@ -290,7 +296,7 @@ add_node() {
                    "server_port": 443
                },
                "private_key": $prikey,
-               "short_id": $sid
+               "short_id": [$sid]
            }
        }
    }]
@@ -345,7 +351,7 @@ add_node() {
         '.inbounds += [{
             "type": "socks",
             "tag": $tag,
-            "listen": "::",
+            "listen": "0.0.0.0",
             "listen_port": ($port|tonumber),
             "users": [{"username": $user, "password": $pass}]
         }]' "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
