@@ -206,7 +206,15 @@ view_nodes() {
         ENCODED=$(echo -n "$USER:$PASS" | base64)
         IPV4=$(curl -s --max-time 2 https://api.ipify.org)
         IPV6=$(get_ipv6_address)
-        echo "[$INDEX] 端口: $PORT | 用户名: $USER | 名称: $TAG"
+
+        # 检测该节点的真实连通性（通过代理 curl 访问 cloudflare.com）
+        if curl -s --socks5-hostname "$USER:$PASS@127.0.0.1:$PORT" --max-time 5 https://cloudflare.com >/dev/null; then
+            STATUS="✅ 可达"
+        else
+            STATUS="❌ 不可达"
+        fi
+
+        echo "[$INDEX] 端口: $PORT | 用户名: $USER | 名称: $TAG | 状态: $STATUS"
         echo "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#$TAG"
         echo "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#$TAG"
         echo "---------------------------------------------------"
