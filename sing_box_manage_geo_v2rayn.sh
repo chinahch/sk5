@@ -187,7 +187,7 @@ restart_singbox() {
 
 # ✅ 修复 Sing-box 功能
 repair_singbox() {
-    echo "⚠️ 将卸载 sing-box 及其依赖并清理..."
+    echo "⚠️ 将卸载 sing-box 并清理..."
     INIT_SYS=$(detect_init_system)
 
     # 停止并移除服务单元
@@ -205,29 +205,13 @@ repair_singbox() {
     rm -f /usr/local/bin/sing-box /usr/local/bin/sk /usr/local/bin/ck
     rm -rf /etc/sing-box
 
-    # 卸载依赖包
-    OS=$(detect_os)
-    case "$OS" in
-        alpine)
-            apk del --no-network curl jq util-linux ;;  
-        debian|ubuntu)
-            apt-get remove -y curl jq uuid-runtime ;;  
-        centos|rhel|fedora)
-            yum remove -y curl jq util-linux ;;  
-        *)
-            echo "⚠️ 未识别系统，跳过依赖卸载，请手动移除 curl/jq/uuidgen 等" ;;
-    esac
-
-    # 重新安装必要依赖，以确保可以拉取远程脚本
-    echo "🔄 重新安装 curl、jq、uuidgen 等依赖..."
-    install_dependencies
-
     echo "✅ 完全卸载完成，开始执行远程安装脚本..."
-    # 使用正确的 raw GitHub URL 执行安装脚本
+    # 使用 GitHub Raw URL 执行最新版安装脚本
     bash <(curl -Ls https://raw.githubusercontent.com/chinahch/sk5/main/install.sh)
 
     echo "✅ 修复并重装完成，Sing-box 已成功安装并启动"
 }
+
 
 # 在 main_menu 中保持选项 6 不变即可调用此函数：
 # 6) 修复 Sing-box（卸载并重装） -> 调用 repair_singbox
