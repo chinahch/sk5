@@ -158,8 +158,15 @@ show_version_info() {
 # 延迟检测
 show_latency() {
     LAT=$(ping -c 3 -W 1 baidu.com 2>/dev/null | awk -F '/' 'END { print $5 }')
-    [[ -z "$LAT" ]] && echo "到百度延迟: 不可达" || echo "到百度延迟: $LAT ms"
+    if [[ -z "$LAT" ]]; then
+        echo "到百度延迟: 不可达"
+        export INNET_GLOBAL="已墙"
+    else
+        echo "到百度延迟: $LAT ms"
+        export INNET_GLOBAL="通畅"
+    fi
 }
+
 
 # 获取国家缩写
 get_country_code() {
@@ -195,6 +202,7 @@ add_node() {
 }
 
 # 查看节点
+# 查看节点（增强版：节点状态 + 外网 + 内网检测）
 view_nodes() {
     jq -c '.inbounds[]' /etc/sing-box/config.json | nl -w2 -s'. ' | while read -r line; do
         INDEX=$(echo "$line" | cut -d. -f1)
@@ -207,19 +215,32 @@ view_nodes() {
         IPV4=$(curl -s --max-time 2 https://api.ipify.org)
         IPV6=$(get_ipv6_address)
 
-        # 检测该节点的真实连通性（通过代理 curl 访问 cloudflare.com）
-        if curl -s --socks5-hostname "$USER:$PASS@127.0.0.1:$PORT" --max-time 5 https://cloudflare.com >/dev/null; then
-            STATUS="✅ 可达"
+        # 节点监听检测
+        if timeout 1 bash -c "</dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
+            NODE_STATUS="正常"
         else
-            STATUS="❌ 不可达"
+            NODE_STATUS="失效"
         fi
 
-        echo "[$INDEX] 端口: $PORT | 用户名: $USER | 名称: $TAG | 状态: $STATUS"
+        # 外网检测：访问 cloudflare.com
+        if curl -s --socks5-hostname "$USER:$PASS@127.0.0.1:$PORT" --max-time 5 https://cloudflare.com >/dev/null; then
+            OUTNET="通畅"
+        else
+            OUTNET="中断"
+        fi
+
+        # 使用主界面检测到的内网状态
+        INNET="$INNET_GLOBAL"
+
+        echo "[$INDEX] 端口: $PORT | 用户名: $USER | 名称: $TAG"
+        echo "节点：$NODE_STATUS | 外网：$OUTNET | 内网：$INNET"
         echo "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#$TAG"
         echo "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#$TAG"
         echo "---------------------------------------------------"
     done
 }
+
+
 
 # 删除节点
 delete_node() {
