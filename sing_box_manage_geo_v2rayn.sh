@@ -164,10 +164,24 @@ restart_singbox() {
 }
 
 
-# ✅ 修复 Sing-box 功能
+# ✅ 修复 Sing-box 功能（增强为可选完全卸载/保留配置）
 repair_singbox() {
-    echo "⚠️ 将卸载 sing-box 并重新安装..."
+    echo ""
+    echo "=== Sing-box（完全卸载--初始化重装） ==="
+    echo "0) 返回主菜单"
+    echo "1) 保留节点配置重新安装"
+    echo "2) 全部删除并初始化安装"
+    read -p "请输入操作编号（默认 1）: " SUBCHOICE
+    SUBCHOICE=${SUBCHOICE:-1}
+
+    if [[ "$SUBCHOICE" == "0" ]]; then
+        echo "🔙 返回主菜单..."
+        return
+    fi
+
     INIT_SYS=$(detect_init_system)
+
+    echo "⚠️ 停止并清理旧服务..."
     if [[ "$INIT_SYS" == "systemd" ]]; then
         systemctl stop sing-box
         systemctl disable sing-box
@@ -177,15 +191,25 @@ repair_singbox() {
         rc-update del sing-box default
         rm -f /etc/init.d/sing-box
     fi
+
+    echo "⚠️ 正在卸载 Sing-box 可执行文件..."
     rm -f /usr/local/bin/sing-box
-    rm -rf /etc/sing-box
     rm -f /usr/local/bin/sk /usr/local/bin/ck
-    echo "✅ 已完成卸载，正在重新安装..."
+
+    if [[ "$SUBCHOICE" == "2" ]]; then
+        echo "⚠️ 删除配置文件和所有节点信息..."
+        rm -rf /etc/sing-box
+    else
+        echo "✅ 保留 /etc/sing-box/config.json 配置文件"
+    fi
+
+    echo "📦 开始重新安装 Sing-box..."
     sleep 2
     install_singbox_if_needed
     setup_shortcut
-    echo "✅ 修复完成，Sing-box 已重新安装并启动"
+    echo "✅ 重装完成，Sing-box 已重新部署并启动"
 }
+
 
 # 显示版本
 show_version_info() {
@@ -414,7 +438,7 @@ view_nodes() {
             UUID=$(echo "$JSON" | jq -r '.users[0].uuid')
             SERVER_NAME=$(echo "$JSON" | jq -r '.tls.reality.handshake.server')
             PUBKEY=$(echo "$JSON" | jq -r '.tls.reality.public_key // empty')
-            SID=$(echo "$JSON" | jq -r '.tls.reality.short_id // empty')
+            SID=$(echo "$JSON" | jq -r '.tls.reality.short_id[0] // empty')
             echo "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${PUBKEY}&type=tcp&headerType=none&shortId=${SID}#$TAG"
         fi
         echo "---------------------------------------------------"
@@ -505,7 +529,7 @@ main_menu() {
     echo "3) 删除用户（通过序号）"
     echo "4) 检查并更新 Sing-box 到最新版"
     echo "5) 重启 Sing-box 服务"
-    echo "6) 修复 Sing-box（卸载并重装）"
+    echo "6) 修复 Sing-box（完全卸载--初始化重装）"
     echo "9) 退出"
     echo "==============================================================="
     read -p "请输入操作编号: " CHOICE
