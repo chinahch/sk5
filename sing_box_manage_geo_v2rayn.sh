@@ -1,4 +1,22 @@
 #!/bin/bash
+# 生成不重复的 tag（自动避开重复）
+generate_unique_tag() {
+    local base="vless-reality-$(get_country_code)"
+    local try=0
+    while true; do
+        RAND=$(tr -dc 'A-Z' </dev/urandom | head -c1)
+        CANDIDATE="${base}-${RAND}"
+        if ! jq -e --arg t "$CANDIDATE" '.inbounds[] | select(.tag == $t)' /etc/sing-box/config.json > /dev/null; then
+            echo "$CANDIDATE"
+            return
+        fi
+        try=$((try+1))
+        if [[ $try -ge 26 ]]; then
+            echo "${base}-$(date +%s)"  # 兜底：加时间戳
+            return
+        fi
+    done
+}
 
 # 检测系统类型
 detect_os() {
@@ -237,9 +255,15 @@ add_node() {
     CONFIG="/etc/sing-box/config.json"
 
     if [[ "$PROTO" == "2" ]]; then
-        # === 添加 VLESS + REALITY (TCP + Vision Flow) 节点 ===
-        read -p "请输入端口号（默认 443）: " PORT
-        PORT=${PORT:-443}
+        # === 添加 VLESS + REALITY 节点 ===
+        read -p "请输入端口号（留空自动随机 30000-39999）: " PORT
+        [[ -z "$PORT" ]] && PORT=$((RANDOM % 1000 + 30000))
+
+        # 检查端口是否已被使用
+        if jq -e --argjson p "$PORT" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" > /dev/null; then
+            echo "⚠️ 端口 $PORT 已存在，请选择其他端口。"
+            return 1
+        fi
 
         # 自动生成 UUID
         if command -v uuidgen >/dev/null 2>&1; then
@@ -248,104 +272,93 @@ add_node() {
             UUID=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/')
         fi
 
-        # Reality 配置默认值
-        SNI_POOL=("www.cloudflare.com" "www.google.com" "www.yahoo.com" "www.microsoft.com" "www.amazon.com" "www.bing.com")
-FINGERPRINT_POOL=("chrome" "firefox" "safari" "ios" "android")
-
-SERVER_NAME=${SNI_POOL[$RANDOM % ${#SNI_POOL[@]}]}
-FINGERPRINT=${FINGERPRINT_POOL[$RANDOM % ${#FINGERPRINT_POOL[@]}]}
-
+        # Reality 默认参数
+        SNI_POOL=("www.cloudflare.com" "www.google.com" "www.yahoo.com" "www.microsoft.com")
+        FINGERPRINT_POOL=("chrome" "firefox" "safari" "ios" "android")
+        SERVER_NAME=${SNI_POOL[$RANDOM % ${#SNI_POOL[@]}]}
+        FINGERPRINT=${FINGERPRINT_POOL[$RANDOM % ${#FINGERPRINT_POOL[@]}]}
         FLOW="xtls-rprx-vision"
-        TAG="vless-reality-$(get_country_code)"
 
-        # 生成公私钥
-        KEY_PAIR=$(sing-box generate reality-keypair 2>/dev/null)
-        PRIVATE_KEY=$(echo "$KEY_PAIR" | grep 'PrivateKey' | awk '{print $2}')
-        PUBLIC_KEY=$(echo "$KEY_PAIR" | grep 'PublicKey' | awk '{print $2}')
+        # 生成 Reality 密钥对
+        KEY_PAIR=$(sing-box generate reality-keypair)
+        PRIVATE_KEY=$(echo "$KEY_PAIR" | awk -F': ' '/PrivateKey/ {print $2}')
+        PUBLIC_KEY=$(echo "$KEY_PAIR" | awk -F': ' '/PublicKey/ {print $2}')
+        [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]] && echo "❌ 密钥对生成失败" && return 1
 
-        if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-            echo "❌ 无法生成 Reality 密钥对，请确认 sing-box 支持 reality-keypair 命令"
-            return 1
-        fi
+        # short_id：2字节 hex（即 4 个字符）
+        SHORT_ID=$(openssl rand -hex 2)
 
-        SHORT_ID=$(openssl rand -hex 8)
+        # 唯一 tag（例如：vless-reality-US-G）
+        LETTER=$(tr -dc 'A-Z' </dev/urandom | head -c1)
+        TAG=$(generate_unique_tag)
+
 
         # 写入配置
         jq --arg port "$PORT" \
-   --arg uuid "$UUID" \
-   --arg prikey "$PRIVATE_KEY" \
-   --arg sid "$SHORT_ID" \
-   --arg server "$SERVER_NAME" \
-   --arg fp "$FINGERPRINT" \
-   --arg flow "$FLOW" \
-   --arg tag "$TAG" \
-   '
-   .inbounds += [{
-       "type": "vless",
-       "tag": $tag,
-       "listen": "0.0.0.0",
-       "listen_port": ($port | tonumber),
-       "users": [{ "uuid": $uuid, "flow": $flow }],
-       "tls": {
-           "enabled": true,
-           "server_name": $server,
-           "reality": {
-               "enabled": true,
-               "handshake": {
-                   "server": $server,
-                   "server_port": 443
-               },
-               "private_key": $prikey,
-               "short_id": [$sid]
-           }
-       }
-   }]
-   ' "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
+           --arg uuid "$UUID" \
+           --arg prikey "$PRIVATE_KEY" \
+           --arg sid "\"$SHORT_ID\"" \
+           --arg server "$SERVER_NAME" \
+           --arg fp "$FINGERPRINT" \
+           --arg flow "$FLOW" \
+           --arg tag "$TAG" \
+        '
+        .inbounds += [{
+            "type": "vless",
+            "tag": $tag,
+            "listen": "0.0.0.0",
+            "listen_port": ($port | tonumber),
+            "users": [{ "uuid": $uuid, "flow": $flow }],
+            "tls": {
+                "enabled": true,
+                "server_name": $server,
+                "reality": {
+                    "enabled": true,
+                    "handshake": {
+                        "server": $server,
+                        "server_port": 443
+                    },
+                    "private_key": $prikey,
+                    "short_id": [$sid | fromjson]
+                }
+            }
+        }]
+        ' "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
 
-
-        # ✅ 校验配置后再重启
-        echo ""
-        echo "🧪 正在校验配置文件..."
+        echo "🧪 正在校验配置..."
         if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
-            echo "✅ 配置校验通过，正在重启 Sing-box 服务..."
+            echo "✅ 配置通过，正在重启 Sing-box..."
             restart_singbox
         else
-            echo "❌ 配置校验失败，Sing-box 未重启。请检查配置："
+            echo "❌ 配置校验失败，请检查 /etc/sing-box/config.json"
             sing-box check -c "$CONFIG"
-            echo ""
-            echo "提示：你可以手动修复 /etc/sing-box/config.json 后运行："
-            echo "systemctl restart sing-box"
             return 1
         fi
 
-        # 构建链接
         IPV4=$(curl -s --max-time 2 https://api.ipify.org)
-        VLESS_LINK="vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FINGERPRINT}#${TAG}"
-
         echo ""
-        echo "✅ VLESS + REALITY 节点已添加："
+        echo "✅ 添加成功：VLESS Reality"
         echo "端口: $PORT"
         echo "UUID: $UUID"
-        echo "Reality 公钥: $PUBLIC_KEY"
-        echo "Reality 私钥: $PRIVATE_KEY"
+        echo "Public Key: $PUBLIC_KEY"
         echo "Short ID: $SHORT_ID"
         echo "SNI: $SERVER_NAME"
         echo "Fingerprint: $FINGERPRINT"
         echo "TAG: $TAG"
         echo ""
-        echo "👉 v2rayN 节点链接（可复制导入）:"
-        echo "$VLESS_LINK"
+        echo "👉 v2rayN 节点链接："
+        echo "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FINGERPRINT}#${TAG}"
         echo ""
 
     else
         # === 添加 SOCKS5 节点 ===
-        read -p "请输入端口号（留空随机）: " PORT
+        read -p "请输入端口号（留空自动）: " PORT
         [[ -z "$PORT" ]] && PORT=$((RANDOM % 10000 + 40000))
         read -p "请输入用户名（默认 user）: " USER
         USER=${USER:-user}
         read -p "请输入密码（默认 pass123）: " PASS
         PASS=${PASS:-pass123}
-        TAG="sk5-$(get_country_code)"
+        TAG="sk5-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
 
         jq --arg port "$PORT" --arg user "$USER" --arg pass "$PASS" --arg tag "$TAG" \
         '.inbounds += [{
@@ -356,31 +369,26 @@ FINGERPRINT=${FINGERPRINT_POOL[$RANDOM % ${#FINGERPRINT_POOL[@]}]}
             "users": [{"username": $user, "password": $pass}]
         }]' "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
 
-        echo ""
-        echo "🧪 正在校验配置文件..."
+        echo "🧪 校验配置..."
         if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
-            echo "✅ 配置校验通过，正在重启 Sing-box 服务..."
+            echo "✅ 配置通过，正在重启..."
             restart_singbox
         else
-            echo "❌ 配置校验失败，Sing-box 未重启。请检查配置："
+            echo "❌ 配置失败，Sing-box 未重启"
             sing-box check -c "$CONFIG"
-            echo ""
-            echo "提示：你可以手动修复 /etc/sing-box/config.json 后运行："
-            echo "systemctl restart sing-box"
             return 1
         fi
 
         ENCODED=$(echo -n "$USER:$PASS" | base64)
         IPV4=$(curl -s --max-time 2 https://api.ipify.org)
         IPV6=$(get_ipv6_address)
-
+        echo ""
         echo "✅ SOCKS5 节点已添加："
-        echo "端口: $PORT | 用户名: $USER | 密码: $PASS"
+        echo "端口: $PORT | 用户: $USER | 密码: $PASS"
         echo "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#$TAG"
         echo "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#$TAG"
     fi
 }
-
 
 # 查看节点
 # 查看节点（增强版：节点状态 + 外网 + 内网检测）
