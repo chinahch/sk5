@@ -289,7 +289,7 @@ add_node() {
         SERVER_NAME=${SNI_POOL[$RANDOM % ${#SNI_POOL[@]}]}
         FINGERPRINT=${FINGERPRINT_POOL[$RANDOM % ${#FINGERPRINT_POOL[@]}]}
         FLOW="xtls-rprx-vision"
-
+		
         # 生成 Reality 密钥对
         KEY_PAIR=$(sing-box generate reality-keypair)
         PRIVATE_KEY=$(echo "$KEY_PAIR" | awk -F': ' '/PrivateKey/ {print $2}')
@@ -302,6 +302,19 @@ add_node() {
         # 唯一 tag（例如：vless-reality-US-G）
         LETTER=$(tr -dc 'A-Z' </dev/urandom | head -c1)
         TAG=$(generate_unique_tag)
+		# === 保存 Reality 元数据，供 view_nodes() 取回 ===
+META="/etc/sing-box/nodes_meta.json"
+mkdir -p /etc/sing-box
+[[ -f "$META" ]] || echo '{}' > "$META"
+
+tmpmeta=$(mktemp)
+jq --arg tag "$TAG" \
+   --arg pbk "$PUBLIC_KEY" \
+   --arg sid "$SHORT_ID" \
+   --arg sni "$SERVER_NAME" \
+   '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni}}' \
+   "$META" > "$tmpmeta" && mv "$tmpmeta" "$META"
+
 
 
         # 写入配置
@@ -429,13 +442,34 @@ view_nodes() {
             ENCODED=$(echo -n "$USER:$PASS" | base64)
             echo "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#$TAG"
             echo "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#$TAG"
-        elif [[ "$TYPE" == "vless" ]]; then
-            UUID=$(echo "$JSON" | jq -r '.users[0].uuid')
-            SERVER_NAME=$(echo "$JSON" | jq -r '.tls.reality.handshake.server')
-            PUBKEY=$(echo "$JSON" | jq -r '.tls.reality.public_key // empty')
-            SID=$(echo "$JSON" | jq -r '.tls.reality.short_id // empty')
-            echo "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${PUBKEY}&type=tcp&headerType=none&shortId=${SID}#$TAG"
+       elif [[ "$TYPE" == "vless" ]]; then
+    UUID=$(echo "$JSON" | jq -r '.users[0].uuid')
+    # 优先从元数据文件取；取不到再从 config 回退
+    META="/etc/sing-box/nodes_meta.json"
+    PBK=$(jq -r --arg tag "$TAG" '.[$tag].pbk // empty' "$META" 2>/dev/null)
+    SID=$(jq -r --arg tag "$TAG" '.[$tag].sid // empty' "$META" 2>/dev/null)
+    SERVER_NAME_META=$(jq -r --arg tag "$TAG" '.[$tag].sni // empty' "$META" 2>/dev/null)
+    SERVER_NAME=${SERVER_NAME_META:-$(echo "$JSON" | jq -r '.tls.reality.handshake.server')}
+
+    # short_id 回退：从 config 的数组里拿第一个
+    [[ -z "$SID" ]] && SID=$(echo "$JSON" | jq -r '.tls.reality.short_id[0] // empty')
+
+    # pbk 回退：尝试由 private_key 推导（若 sing-box 支持）
+    if [[ -z "$PBK" ]]; then
+        PRIV=$(echo "$JSON" | jq -r '.tls.reality.private_key // empty')
+        if [[ -n "$PRIV" ]]; then
+            PBK=$(sing-box generate reality-keypair --private-key "$PRIV" 2>/dev/null \
+                  | awk -F': ' '/PublicKey/ {print $2}')
         fi
+    fi
+
+    if [[ -z "$PBK" || -z "$SID" ]]; then
+        echo "⚠️ 此节点缺少 pbk/sid，请使用“添加成功时”打印的那条链接或重新添加节点。"
+    fi
+
+    echo "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${PBK}&sid=${SID}&sni=${SERVER_NAME}&fp=chrome#${TAG}"
+fi
+
         echo "---------------------------------------------------"
     done
 }
@@ -443,6 +477,8 @@ view_nodes() {
 # 删除节点
 delete_node() {
     CONFIG="/etc/sing-box/config.json"
+    META="/etc/sing-box/nodes_meta.json"
+
     COUNT=$(jq '.inbounds | length' "$CONFIG")
     [[ $COUNT -eq 0 ]] && echo "暂无节点" && return
 
@@ -454,15 +490,45 @@ delete_node() {
     if [[ "$IDX" == "0" ]]; then
         read -p "⚠️ 确认删除全部节点？此操作不可恢复！(y/n): " CONFIRM
         [[ "$CONFIRM" != "y" ]] && echo "❌ 已取消删除" && return
-        jq '.inbounds = []' "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
+
+        # 清空 config 中的 inbounds
+        tmpcfg=$(mktemp)
+        jq '.inbounds = []' "$CONFIG" > "$tmpcfg" && mv "$tmpcfg" "$CONFIG"
+
+        # 同步清空元数据
+        if [[ -f "$META" ]]; then
+            echo '{}' > "$META"
+        fi
+
         echo "✅ 所有节点已删除（无需立即重启）"
         return
     fi
 
+    # 转为 0 基序号
     IDX=$((IDX - 1))
-    jq "del(.inbounds[$IDX])" "$CONFIG" > /tmp/tmp_config && mv /tmp/tmp_config "$CONFIG"
+
+    # 合法性校验
+    if [[ $IDX -lt 0 || $IDX -ge $COUNT ]]; then
+        echo "❌ 无效序号：$((IDX + 1))"
+        return
+    fi
+
+    # 先取出将要删除的 tag
+    TAG_TO_DELETE=$(jq -r ".inbounds[$IDX].tag // empty" "$CONFIG")
+
+    # 删除 config 中对应入站
+    tmpcfg=$(mktemp)
+    jq "del(.inbounds[$IDX])" "$CONFIG" > "$tmpcfg" && mv "$tmpcfg" "$CONFIG"
+
+    # 删除元数据中对应条目
+    if [[ -n "$TAG_TO_DELETE" && -f "$META" ]]; then
+        tmpmeta=$(mktemp)
+        jq "del(.\"$TAG_TO_DELETE\")" "$META" > "$tmpmeta" && mv "$tmpmeta" "$META"
+    fi
+
     echo "✅ 已删除节点 [$((IDX + 1))]（无需立即重启）"
 }
+
 # 更新 sing-box
 update_singbox() {
     echo "📦 正在检查 Sing-box 更新..."
