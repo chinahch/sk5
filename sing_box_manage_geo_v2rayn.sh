@@ -593,7 +593,7 @@ update_singbox() {
 
 # 修复/重装菜单
 reinstall_menu() {
-  say "=== 修复 / 重装 Sing-box ==="
+  say "=== 卸载 / 重装 Sing-box ==="
   say "1) 完全卸载（删除程序与全部节点配置）"
   say "2) 重装（保留节点与配置，重新初始化服务脚本）"
   say "0) 返回主菜单"
