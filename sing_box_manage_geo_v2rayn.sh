@@ -121,7 +121,7 @@ port_status() {
     if [[ -z "$out" ]]; then
       return 2
     fi
-    if grep -q '^sing-box$' <<<"$out"; then
+    if echo "$out" | grep -Eq '^(sing-box|hysteria)$'; then
       return 0
     else
       return 1
@@ -132,7 +132,7 @@ port_status() {
     if ! grep -q LISTEN <<<"$out"; then
       return 2
     fi
-    if grep -q 'users:(("sing-box"' <<<"$out"; then
+    if grep -q 'users:(("sing-box"' <<<"$out" || grep -q 'users:(("hysteria"' <<<"$out"; then
       return 0
     else
       return 1
@@ -156,7 +156,6 @@ ExecStart=/bin/sh -c '\
   /usr/local/bin/sing-box check -c /etc/sing-box/config.json || { echo "config check failed"; exit 1; }; \
   exec /usr/local/bin/sing-box run -c /etc/sing-box/config.json \
 '
-
 Restart=on-failure
 RestartSec=1s
 StartLimitIntervalSec=30
@@ -175,8 +174,7 @@ EOF
 }
 
 ensure_service_openrc() {
-  cat <<'EOF' >/etc/init.d/s极速模式
-ing-box
+  cat <<'EOF' >/etc/init.d/sing-box
 #!/sbin/openrc-run
 name="sing-box"
 description="Sing-box Service"
@@ -221,7 +219,7 @@ restart_singbox() {
     sleep 0.4
     systemctl start sing-box --no-block >/dev/null 2>&1 || true
 
-    local ok=0 i state any_listen
+    local ok=0 i any_listen
     for i in {1..60}; do  # 30s
       any_listen=$(jq -r '.inbounds[]?.listen_port' "$CONFIG" 2>/dev/null | while read -r p; do
         [[ -z "$p" ]] && continue
@@ -229,8 +227,7 @@ restart_singbox() {
         if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/$p" >/dev/null 2>&1; then echo ok; break; fi
       done)
       if [[ "$any_listen" == "ok" ]]; then ok=1; break; fi
-      if systemctl is-active --quiet sing-box; then ok=极速模式
-1; break; fi
+      if systemctl is-active --quiet sing-box; then ok=1; break; fi
       printf "."; sleep 0.5
     done
     echo
@@ -276,18 +273,6 @@ ensure_autostart() {
   esac
 }
 
-# ---------------------- 版本与状态 ----------------------
-show_version_info() {
-  if command -v sing-box >/dev/null 2>&1; then
-    local VER ENV
-    VER=$(sing-box version 2>/dev/null | awk '/sing-box version/{print $3}')
-    ENV=$(sing-box version 2>/dev/null | awk -F'Environment: ' '/Environment:/{print $2}')
-    say "Sing-box 版本: ${VER:-未知}  | 架构: ${ENV:-未知}"
-  else
-    say "Sing-box 版本: 未知  | 架构: 未知"
-  fi
-}
-
 # ---------------------- 节点操作 ----------------------
 add_node() {
   while true; do
@@ -295,14 +280,18 @@ add_node() {
     say "0) 返回主菜单"
     say "1) SOCKS5"
     say "2) VLESS-REALITY"
+    say "3) Hysteria2"
     read -rp "输入协议编号（默认 1，输入 0 返回）: " PROTO
     PROTO=${PROTO:-1}
     [[ "$PROTO" == "0" ]] && return
-    [[ "$PROTO" =~ ^[12]$ ]] && break
+    [[ "$PROTO" =~ ^[123]$ ]] && break
     warn "无效输入"
   done
 
-  if [[ "$PROTO" == "2" ]]; then
+  if [[ "$PROTO" == "3" ]]; then
+    add_hysteria2_node || return 1
+    return
+  elif [[ "$PROTO" == "2" ]]; then
     if ! command -v sing-box >/dev/null 2>&1; then
       err "未检测到 sing-box，无法生成 Reality 密钥。请先选择菜单 6 → 重装（保留节点）或安装。"
       return 1
@@ -311,12 +300,14 @@ add_node() {
     local PORT
     while true; do
       read -rp "请输入端口号（留空自动随机 30000-39999；输入 0 返回）: " PORT
-      if [[ -z "$PORT" ]]; then PORT=$((RANDOM % 1000 + 30000)); say "（已自动选择随机端口：$PORT）"; fi
+      if [[ -z "$PORT" ]]; then 
+        PORT=$((RANDOM % 1000 + 30000))
+        say "（已自动选择随机端口：$PORT）"
+      fi
       [[ "$PORT" == "0" ]] && return
       if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then
         warn "端口无效"; continue
       fi
-      # 配置中是否已存在
       if jq -e --argjson p "$PORT" '.inbounds[]? | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
         warn "端口 $PORT 已存在，请换一个。"
         continue
@@ -325,18 +316,29 @@ add_node() {
     done
 
     local UUID FP FLOW SERVER_NAME KEY_PAIR PRIVATE_KEY PUBLIC_KEY SHORT_ID TAG tmpcfg
-    if command -v uuidgen >/dev/null 2>&1; then UUID=$(uuidgen); else UUID=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/'); fi
+    if command -v uuidgen >/dev/null 2>&1; then 
+      UUID=$(uuidgen)
+    else 
+      UUID=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/')
+    fi
     SERVER_NAME="www.cloudflare.com"
     FLOW="xtls-rprx-vision"
     # 指纹随机
     case $((RANDOM%5)) in
-      0) FP="chrome";; 1) FP="firefox";; 2) FP="safari";; 3) FP="ios";; *) FP="android";;
+      0) FP="chrome";;
+      1) FP="firefox";;
+      2) FP="safari";;
+      3) FP="ios";;
+      *) FP="android";;
     esac
 
     KEY_PAIR=$(sing-box generate reality-keypair 2>/dev/null)
     PRIVATE_KEY=$(awk -F': ' '/PrivateKey/{print $2}' <<<"$KEY_PAIR")
     PUBLIC_KEY=$(awk -F': ' '/PublicKey/{print $2}' <<<"$KEY_PAIR")
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then err "生成 Reality 密钥失败"; return 1; fi
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then 
+      err "生成 Reality 密钥失败"
+      return 1
+    fi
     SHORT_ID=$(openssl rand -hex 4)
     TAG=$(generate_unique_tag)
 
@@ -349,39 +351,38 @@ add_node() {
        --arg fp "$FP" \
        --arg flow "$FLOW" \
        --arg tag "$TAG" \
-      '
-      .inbounds += [{
-        "type": "vless",
-        "tag": $tag,
-        "listen": "0.0.0.0",
-        "listen_port": ($port | tonumber),
-        "users": [{ "uuid": $uuid, "flow": $flow }],
-        "tls": {
-          "enabled": true,
-          "server_name": $server,
-          "reality": {
-            "enabled": true,
-            "handshake": { "server": $server, "server_port": 443 },
-            "private_key": $prikey,
-            "short_id": [ $sid ]
-          }
-        }
-      }]
-      ' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
+       '.inbounds += [{
+         "type": "vless",
+         "tag": $tag,
+         "listen": "0.0.0.0",
+         "listen_port": ($port | tonumber),
+         "users": [{ "uuid": $uuid, "flow": $flow }],
+         "tls": {
+           "enabled": true,
+           "server_name": $server,
+           "reality": {
+             "enabled": true,
+             "handshake": { "server": $server, "server_port": 443 },
+             "private_key": $prikey,
+             "short_id": [ $sid ]
+           }
+         }
+       }]' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
 
     say "🧪🧪 正在校验配置..."
     if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
       ok "配置通过，正在重启 Sing-box..."
       restart_singbox || { err "重启失败"; return 1; }
     else
-      err "配置校验失败，请检查 $CONFIG"; sing-box check -c "$CONFIG"; return 1
+      err "配置校验失败，请检查 $CONFIG"
+      sing-box check -c "$CONFIG"
+      return 1
     fi
 
     # 保存元数据
     local tmpmeta; tmpmeta=$(mktemp)
     jq --arg tag "$TAG" --arg pbk "$PUBLIC_KEY" --arg sid "$SHORT_ID" --arg sni "$SERVER_NAME" --arg port "$PORT" --arg fp "$FP" \
-      '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni, port:$port, fp:$fp}}' \
-      "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
+      '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni, port:$port, fp:$fp}}' "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
 
     local IPV4; IPV4=$(curl -s --max-time 2 https://api.ipify.org)
     say ""
@@ -392,7 +393,7 @@ add_node() {
     say "Short ID: $SHORT_ID"
     say "SNI: $SERVER_NAME"
     say "Fingerprint: $FP"
-    say "TAG: $T极速模式AG"
+    say "TAG: $TAG"
     say ""
     say "👉 客户端链接："
     say "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
@@ -403,9 +404,14 @@ add_node() {
     local PORT USER PASS TAG tmpcfg
     while true; do
       read -rp "请输入端口号（留空自动随机 40000-49999；输入 0 返回）: " PORT
-      if [[ -z "$PORT" ]]; then PORT=$((RANDOM % 10000 + 40000)); say "（已自动选择随机端口：$PORT）"; fi
+      if [[ -z "$PORT" ]]; then 
+        PORT=$((RANDOM % 10000 + 40000))
+        say "（已自动选择随机端口：$PORT）"
+      fi
       [[ "$PORT" == "0" ]] && return
-      if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then warn "端口无效"; continue; fi
+      if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then 
+        warn "端口无效"; continue
+      fi
       if jq -e --argjson p "$PORT" '.inbounds[]? | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
         warn "端口 $PORT 已存在，请换一个。"; continue
       fi
@@ -425,34 +431,183 @@ add_node() {
       ok "配置通过，正在重启..."
       restart_singbox || { err "重启失败"; return 1; }
     else
-      err "配置校验失败"; sing-box check -c "$CONFIG"; return 1
+      err "配置校验失败，请检查 $CONFIG"
+      sing-box check -c "$CONFIG"
+      return 1
     fi
 
-    local ENCODED IPV4 IPV6
-    ENCODED=$(printf "%s" "$USER:$PASS" | base64)
-    IPV4=$(curl -s --max-time 2 https://api.ipify.org)
-    IPV6=$(get_ipv6_address)
     say ""
-    ok "SOCKS5 节点已添加："
-    say "端口: $PORT | 用户: $USER | 密码: $PASS"
-    say "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#$TAG"
-    [[ -n "$IPV6" ]] && say "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#$TAG"
+    ok "添加成功：SOCKS5"
+    say "端口: $PORT"
+    say "用户名: $USER"
+    say "密码: $PASS"
+    say "TAG: $TAG"
+    say ""
+    say "👉 客户端链接："
+    local IPV4; IPV4=$(curl -s --max-time 2 https://api.ipify.org)
+    local IPV6; IPV6=$(get_ipv6_address)
+    if [[ -n "$IPV4" ]]; then
+      local CREDS; CREDS=$(printf "%s" "$USER:$PASS" | base64)
+      say "IPv4: socks://${CREDS}@${IPV4}:${PORT}#$TAG"
+      [[ -n "$IPV6" ]] && say "IPv6: socks://${CREDS}@[${IPV6}]:${PORT}#$TAG"
+    else
+      say "请使用 domain/IP 和端口连接 SOCKS5 节点 (用户名: $USER, 密码: $PASS)"
+    fi
+    say ""
   fi
 }
 
-# 从私钥推导公钥（若版本支持）
-derive_pbk_from_priv() {
-  local PRIV="$1"
-  [[ -z "$PRIV" ]] && return 1
-  local out
-  out=$(sing-box generate reality-keypair --private-key "$PRIV" 2>/dev/null) || return 1
-  awk -F': ' '/PublicKey/{print $2}' <<<"$out"
-  return 0
+add_hysteria2_node() {
+  # 检查是否已存在 Hysteria2 节点
+  if systemctl is-active --quiet hysteria2; then
+    err "检测到 Hysteria2 服务正在运行，无法重复添加。"
+    return 1
+  fi
+
+  local PORT
+  while true; do
+    read -rp "请输入端口号（留空自动随机 50000-59999；输入 0 返回）: " PORT
+    if [[ -z "$PORT" ]]; then
+      PORT=$((RANDOM % 10000 + 50000))
+      say "（已自动选择随机端口：$PORT）"
+    fi
+    [[ "$PORT" == "0" ]] && return
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then
+      warn "端口无效"; continue
+    fi
+    if jq -e --argjson p "$PORT" '.inbounds[]? | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
+      warn "端口 $PORT 已存在，请换一个。"
+      continue
+    fi
+    break
+  done
+
+  local DOMAIN
+  read -rp "请输入伪装域名（默认 bing.com）: " DOMAIN
+  DOMAIN=${DOMAIN:-bing.com}
+
+  # 安装 Hysteria2（如未安装）
+  if ! command -v hysteria >/dev/null 2>&1; then
+    warn "未检测到 hysteria，正在安装..."
+    local H_VERSION="2.6.2"
+    local arch=$(uname -m)
+    case "$arch" in
+      x86_64|amd64) arch="amd64" ;;
+      aarch64|arm64) arch="arm64" ;;
+      *) err "暂不支持的架构：$arch"; return 1 ;;
+    esac
+    local tmp; tmp=$(mktemp -d)
+    (
+      set -e
+      cd "$tmp"
+      curl -sSL "https://github.com/apernet/hysteria/releases/download/app/v${H_VERSION}/hysteria-linux-${arch}" -o hysteria-bin || {
+        err "下载 hysteria 失败"; exit 1; }
+      install -m 0755 hysteria-bin /usr/local/bin/hysteria
+    ) || { rm -rf "$tmp"; return 1; }
+    rm -rf "$tmp"
+    ok "hysteria 安装完成"
+  fi
+
+  mkdir -p /etc/hysteria2
+
+  # 生成自签证书
+  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria2/server.key 2>/dev/null || \
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out /etc/hysteria2/server.key 2>/dev/null
+  openssl req -new -x509 -nodes -key /etc/hysteria2/server.key -out /etc/hysteria2/server.crt -subj "/CN=${DOMAIN}" -days 36500 >/dev/null 2>&1 || {
+    err "自签证书生成失败"; return 1; }
+
+  # 生成密码
+  local DEFAULT_AUTH AUTH_PWD OBFS_PWD
+  DEFAULT_AUTH=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
+  read -rp "请输入验证密码（留空随机生成）: " AUTH_PWD
+  AUTH_PWD=${AUTH_PWD:-$DEFAULT_AUTH}
+  OBFS_PWD=$(openssl rand -base64 8 | tr -d '=+/' | cut -c1-8)
+
+  # 生成唯一 TAG
+  local TAG="hysteria2-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
+  if jq -e --arg t "$TAG" '.inbounds[]? | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1; then
+    TAG="hysteria2-$(get_country_code)-$(date +%s)"
+  fi
+
+  # 写入配置文件
+  cat > /etc/hysteria2/server.yaml <<EOF
+listen: ":${PORT}"
+tls:
+  cert: /etc/hysteria2/server.crt
+  key: /etc/hysteria2/server.key
+obfs:
+  type: salamander
+  salamander:
+    password: ${OBFS_PWD}
+auth:
+  type: password
+  password: ${AUTH_PWD}
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${DOMAIN}
+    rewriteHost: true
+    insecure: true
+EOF
+
+  # 创建 systemd 服务
+  cat > /etc/systemd/system/hysteria2.service <<EOF
+[Unit]
+Description=Hysteria2 Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria2/server.yaml
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  # 启动服务
+  systemctl daemon-reload
+  systemctl enable --now hysteria2 >/dev/null 2>&1 || true
+
+  sleep 1
+  if systemctl is-active --quiet hysteria2; then
+    ok "Hysteria2 服务已启动"
+  else
+    err "Hysteria2 服务启动失败，请检查日志 (journalctl -u hysteria2)"
+    return 1
+  fi
+
+  # 保存元数据
+  local tmpmeta; tmpmeta=$(mktemp)
+  jq --arg tag "$TAG" --arg port "$PORT" --arg sni "$DOMAIN" --arg obfs "$OBFS_PWD" --arg auth "$AUTH_PWD" \
+    '. + {($tag): {type:"hysteria2", port:$port, sni:$sni, obfs:$obfs, auth:$auth}}' "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
+
+  # 输出信息
+  local IPV4 IPV6
+  IPV4=$(curl -s --max-time 2 https://api.ipify.org || echo "")
+  [[ -z "$IPV4" ]] && IPV4="<服务器IP>"
+  IPV6=$(get_ipv6_address)
+  say ""
+  ok "添加成功：Hysteria2"
+  say "端口: $PORT"
+  say "Auth密码: $AUTH_PWD"
+  say "Obfs密码: $OBFS_PWD"
+  say "SNI域名: $DOMAIN"
+  say "TAG: $TAG"
+  say ""
+  say "👉 客户端链接："
+  if [[ -n "$IPV4" ]]; then
+    say "hysteria2://${AUTH_PWD}@${IPV4}:${PORT}?obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
+  fi
+  if [[ -n "$IPV6" ]]; then
+    say "hysteria2://${AUTH_PWD}@[${IPV6}]:${PORT}?obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
+  fi
+  say ""
 }
 
-# 修复后的 view_nodes 函数
-# 修复后的 view_nodes 函数
-# 修复后的 view_nodes 函数
 view_nodes() {
   # 禁用严格错误模式
   set +e
@@ -460,17 +615,17 @@ view_nodes() {
   # 获取服务器IP地址
   local IPV4
   IPV4=$(curl -s --max-time 2 https://api.ipify.org || echo "")
-  [[ -z "$IP极速模式
-V4" ]] && IPV4="<服务器IP>"
+  [[ -z "$IPV4" ]] && IPV4="<服务器IP>"
   
   local IPV6
   IPV6=$(get_ipv6_address)
-  
+
   # 获取节点总数
-  local total
+  local total ext_count
   total=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo "0")
-  
-  if [[ -z "$total" || "$total" == "0" ]]; then 
+  ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null || echo "0")
+
+  if [[ ( -z "$total" || "$total" == "0" ) && ( -z "$ext_count" || "$ext_count" == "0" ) ]]; then 
     say "暂无节点"
     set -e
     return
@@ -498,24 +653,21 @@ V4" ]] && IPV4="<服务器IP>"
     if [[ "$TYPE" == "vless" ]]; then
       # 获取节点基本信息
       UUID=$(jq -r '.users[0].uuid' <<<"$json")
-      
       # 获取元数据
       PBK=$(jq -r --arg tag "$TAG" '.[$tag].pbk // empty' "$META" 2>/dev/null)
       SID=$(jq -r --arg tag "$TAG" '.[$tag].sid // empty' "$META" 2>/dev/null)
       SERVER_NAME=$(jq -r --arg tag "$TAG" '.[$tag].sni // empty' "$META" 2>/dev/null)
       FP=$(jq -r --arg tag "$TAG" '.[$tag].fp // "chrome"' "$META" 2>/dev/null)
-      
       # 从配置中提取后备值
       [[ -z "$SERVER_NAME" || "$SERVER_NAME" == "null" ]] && SERVER_NAME=$(jq -r '.tls.reality.handshake.server // .tls.server_name // empty' <<<"$json")
       [[ -z "$SID" || "$SID" == "null" ]] && SID=$(jq -r '.tls.reality.short_id[0] // empty' <<<"$json")
-      
       # 生成客户端链接
       if [[ -n "$PBK" && -n "$SID" && -n "$SERVER_NAME" ]]; then
         say "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${PBK}&sid=${SID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
       else
         warn "节点参数不完整，无法生成链接"
       fi
-      
+
     elif [[ "$TYPE" == "socks" ]]; then
       # SOCKS5节点处理
       local USER PASS ENCODED
@@ -525,18 +677,48 @@ V4" ]] && IPV4="<服务器IP>"
       say "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#$TAG"
       [[ -n "$IPV6" ]] && say "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#$TAG"
     fi
-    
+
     say "---------------------------------------------------"
-    
   done < <(jq -c '.inbounds[]' "$CONFIG" 2>/dev/null)
+
+  # 列出 Hysteria2 节点
+  if [[ -n "$ext_count" && "$ext_count" != "0" ]]; then
+    for key in $(jq -r 'to_entries[] | select(.value.type=="hysteria2") | .key' "$META"); do
+      idx=$((idx+1))
+      local PORT TAG TYPE AUTH OBFS SNI
+      TAG="$key"
+      PORT=$(jq -r --arg t "$TAG" '.[$t].port // empty' "$META")
+      TYPE="hysteria2"
+      say "[$idx] 端口: $PORT | 协议: $TYPE | 名称: $TAG"
+      port_status "$PORT"
+      case $? in
+        0) : ;;
+        1) warn "端口 $PORT 被其他进程占用" ;;
+        2) warn "端口 $PORT 未监听" ;;
+      esac
+      AUTH=$(jq -r --arg t "$TAG" '.[$t].auth // empty' "$META")
+      OBFS=$(jq -r --arg t "$TAG" '.[$t].obfs // empty' "$META")
+      SNI=$(jq -r --arg t "$TAG" '.[$t].sni // empty' "$META")
+      if [[ -n "$AUTH" && -n "$OBFS" && -n "$SNI" ]]; then
+        say "hysteria2://${AUTH}@${IPV4}:${PORT}?obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
+        [[ -n "$IPV6" ]] && say "hysteria2://${AUTH}@[${IPV6}]:${PORT}?obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
+      else
+        warn "节点参数不完整，无法生成链接"
+      fi
+      say "---------------------------------------------------"
+    done
+  fi
 
   # 恢复严格错误模式
   set -e
 }
-# 删除节点函数
+
 delete_node() {
   local COUNT; COUNT=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null)
-  if [[ -z "$COUNT" || "$COUNT" == "0" ]]; then say "暂无节点"; return; fi
+  local ext_count; ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null)
+  if [[ ( -z "$COUNT" || "$COUNT" == "0" ) && ( -z "$ext_count" || "$ext_count" == "0" ) ]]; then 
+    say "暂无节点"; return
+  fi
   view_nodes
   say "[0] 返回主菜单"
   say "[all] 删除所有节点"
@@ -547,11 +729,29 @@ delete_node() {
     local tmpcfg; tmpcfg=$(mktemp)
     jq '.inbounds = []' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
     printf '{}' >"$META"
+    systemctl disable --now hysteria2 >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/hysteria2.service
+    systemctl daemon-reload || true
+    rm -rf /etc/hysteria2
     ok "所有节点已删除"; return
   fi
   if ! [[ "$IDX" =~ ^[0-9]+$ ]]; then warn "无效输入"; return; fi
   local idx0=$((IDX-1))
-  if ((idx0<0 || idx0>=COUNT)); then warn "序号越界"; return; fi
+  if (( idx0 < 0 || idx0 >= (COUNT + ext_count) )); then warn "序号越界"; return; fi
+  if (( idx0 >= COUNT )); then
+    local ext_index=$((idx0 - COUNT))
+    local tag_to_delete; tag_to_delete=$(jq -r --argjson i "$ext_index" 'to_entries | map(select(.value.type=="hysteria2")) | .[$i].key // empty' "$META")
+    if [[ -n "$tag_to_delete" && "$tag_to_delete" != "null" ]]; then
+      local tmpmeta; tmpmeta=$(mktemp)
+      jq "del(.\"$tag_to_delete\")" "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
+    fi
+    systemctl disable --now hysteria2 >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/hysteria2.service
+    systemctl daemon-reload || true
+    rm -rf /etc/hysteria2
+    ok "已删除节点 [$IDX]"
+    return
+  fi
   local tag; tag=$(jq -r ".inbounds[$idx0].tag // empty" "$CONFIG")
   local tmpcfg; tmpcfg=$(mktemp)
   jq "del(.inbounds[$idx0])" "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
@@ -562,109 +762,18 @@ delete_node() {
   ok "已删除节点 [$IDX]"
 }
 
-# 更新 Sing-box 函数
-update_singbox() {
-  say "📦📦 正在检查 Sing-box 更新..."
-  local CUR LATEST ARCH tmp
-  CUR=$(sing-box version 2>/dev/null | awk '/sing-box version/{print $3}')
-  say "当前版本: ${CUR:-未知}"
-  LATEST=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
-  if [[ -z "$LATEST" ]]; then warn "获取最新版本失败"; return; fi
-  say "最新版本: $LATEST"
-  [[ "$CUR" == "$LATEST" ]] && { ok "已是最新版"; return; }
-  read -rp "是否更新到 $LATEST？(y/N): " c; [[ "$c" == "y" ]] || { say "已取消"; return; }
-  ARCH=$(uname -m); case "$ARCH" in x86_64|amd64) ARCH="amd64";; aarch64|arm64) ARCH="arm64";; *) err "不支持架构 $ARCH"; return 1;; esac
-  tmp=$(mktemp -d)
-  (
-    set -e
-    cd "$tmp"
-    curl -fsSLO "https://github.com/SagerNet/sing-box/releases/download/v${LATEST}/sing-box-${LATEST}-linux-${ARCH}.tar.gz"
-    tar -xzf "sing-box-${LATEST}-linux-${ARCH}.tar.gz"
-    local init; init=$(detect_init_system)
-    [[ "$init" == "systemd" ]] && systemctl stop sing-box || true
-    [[ "$init" == "openrc"  ]] && rc-service sing-box stop >/dev/null 2>&1 || true
-    install -m 0755 "sing-box-${LATEST}-linux-${ARCH}/sing-box" /usr/local/bin/sing-box
-    [[ "$init" == "systemd" ]] && systemctl start sing-box || true
-    [[ "$init" == "openrc"  ]] && rc-service sing-box start >/dev/null 2>&1 || true
-  ) || { err "升级失败"; rm -rf "$tmp"; return 1; }
-  rm -rf "$tmp"
-  ok "已成功升级为 v${LATEST}"
+show_version_info() {
+  if command -v sing-box >/dev/null 2>&1; then
+    local VER ENV
+    VER=$(sing-box version 2>/dev/null | awk '/sing-box version/{print $3}')
+    ENV=$(sing-box version 2>/dev/null | awk -F'Environment: ' '/Environment:/{print $2}')
+    say "Sing-box 版本: ${VER:-未知}  | 架构: ${ENV:-未知}"
+  else
+    say "Sing-box 版本: 未知  | 架构: 未知"
+  fi
 }
 
-# 修复/重装菜单
-reinstall_menu() {
-  say "=== 卸载 / 重装 Sing-box ==="
-  say "1) 完全卸载（删除程序与全部节点配置）"
-  say "2) 重装（保留节点与配置，重新初始化服务脚本）"
-  say "0) 返回主菜单"
-  read -rp "请选择: " ans
-  case "$ans" in
-    1)
-      warn "开始完全卸载 Sing-box..."
-      local init; init=$(detect_init_system)
-      if [[ "$init" == "systemd" ]]; then
-        systemctl stop sing-box 2>/dev/null || true
-        systemctl disable sing-box 2>/dev/null || true
-        rm -f /etc/systemd/system/sing-box.service
-        systemctl daemon-reload || true
-      elif [[ "$init" == "openrc" ]]; then
-        rc-service sing-box stop >/dev/null 2>&1 || true
-        rc-update del sing-box default >/dev/null 2>&1 || true
-        rm -f /etc/init.d/sing-box
-      fi
-      pkill -9 -f "/usr/local/bin/sing-box run -c /etc/sing-box/config.json" 2>/dev/null || true
-      rm -f /usr/local/bin/sing-box /极速模式
-usr/local/bin/sk /usr/local/bin/ck
-      rm -rf /etc/sing-box
-      ok "已完成完全卸载。"
-      ;;
-    2)
-      warn "开始重装（保留节点）..."
-      ensure_dirs
-      install_singbox_if_needed || true
-      case "$(detect_init_system)" in
-        systemd) ensure_service_systemd ;;
-        openrc)  ensure_service_openrc ;;
-        *) warn "未知 init，跳过服务脚本";;
-      esac
-      if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
-        ok "配置校验通过"; restart_singbox || true
-      else
-        warn "配置校验失败，尝试自动修复..."
-        # 最小修：确保 users[0].uuid / tls.reality.short_id 至少存在
-        local tmpcfg; tmpcfg=$(mktemp)
-        jq -r '
-          def ensure_uuid(u): if (u|type)!="string" or (u|length)==0 then "00000000-0000-4000-8000-000000000000" else u end;
-          def ensure_sid(a): if (a|type)!="array" or (a|length)==0 then ["abcdef12"] else a end;
-          .inbounds |= ( . // [] | map(
-            if .type=="vless" then
-              .users[0].uuid = ensure_uuid(.users[0].uuid) |
-              .tls.reality.short_id = ensure_sid(.tls.reality.short_id)
-            else . end
-          ))
-        ' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
-        if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
-          ok "自动修复成功"; restart_singbox || true
-        else
-          local bak="/etc/sing-box.bak-$(date +%s)"
-          cp -a /etc/sing-box "$bak"
-          err "自动修复后仍然校验失败，已保留备份：$bak"
-        fi
-      fi
-      ;;
-    *) return;;
-  esac
-}
-
-# 设置快捷方式
-setup_shortcut() {
-  local MAIN_CMD="/usr/local/bin/sk" ALT_CMD="/usr/local/bin/ck"
-  local SCRIPT_PATH="$(realpath "$0" 2>/dev/null || readlink -f "$0")"
-  [[ -f "$MAIN_CMD" ]] || { printf '#!/usr/bin/env bash\nexec bash "%s"\n' "$SCRIPT_PATH" >"$MAIN_CMD"; chmod +x "$MAIN_CMD"; }
-  [[ -f "$ALT_CMD"  ]] || { printf '#!/usr/bin/env bash\nexec bash "%s"\n' "$SCRIPT_PATH" >"$ALT_CMD";  chmod +x "$ALT_CMD";  }
-}
-
-# 主菜单
+# ---------------------- 主菜单 ----------------------
 main_menu() {
   say ""
   show_version_info
@@ -695,5 +804,5 @@ ensure_dirs
 install_dependencies
 install_singbox_if_needed || true
 ensure_autostart
-setup_shortcut
+# 如需快捷方式，可自行创建，例如 ln -sf "$(realpath "$0")" /usr/local/bin/sk
 while true; do main_menu; done
