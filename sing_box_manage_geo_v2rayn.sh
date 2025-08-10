@@ -11,7 +11,7 @@ META="/etc/sing-box/nodes_meta.json"
 
 say() { printf "%s\n" "$*"; }
 err() { printf " %s\n" "$*" >&2; }
-ok()  { printf "? %s\n" "$*"; }
+ok()  { printf " %s\n" "$*"; }
 warn(){ printf " %s\n" "$*"; }
 
 # ---------------------- 工具函数 ----------------------
@@ -116,7 +116,7 @@ generate_unique_tag() {
   while true; do
     RAND=$(tr -dc 'A-Z' </dev/urandom 2>/dev/null | head -c1)
     CANDIDATE="${base}-${RAND}"
-    if ! jq -e --arg t "$CANDIDATE" '.inbounds[]? | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1; then
+    if ! jq -e --arg t "$CANDIDATE" '.inbounds[] | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1; then
       printf "%s\n" "$CANDIDATE"
       return
     fi
@@ -219,7 +219,7 @@ restart_singbox() {
 
     local ok=0 i any_listen
     for i in {1..60}; do  # 30s
-      any_listen=$(jq -r '.inbounds[]?.listen_port' "$CONFIG" 2>/dev/null | while read -r p; do
+      any_listen=$(jq -r '.inbounds[].listen_port' "$CONFIG" 2>/dev/null | while read -r p; do
         [[ -z "$p" ]] && continue
         if ss -ltnp 2>/dev/null | grep -q ":$p "; then echo ok; break; fi
         if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/$p" >/dev/null 2>&1; then echo ok; break; fi
@@ -271,7 +271,7 @@ restart_singbox() {
     local SING_PID=$!
     local ok_flag=0 i any_listen
     for i in {1..60}; do
-      any_listen=$(jq -r '.inbounds[]?.listen_port' "$CONFIG" 2>/dev/null | while read -r p; do
+      any_listen=$(jq -r '.inbounds[].listen_port' "$CONFIG" 2>/dev/null | while read -r p; do
         [[ -z "$p" ]] && continue
         if ss -ltnp 2>/dev/null | grep -q ":$p "; then echo ok; break; fi
         if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/$p" >/dev/null 2>&1; then echo ok; break; fi
@@ -359,7 +359,7 @@ reinstall_menu() {
     case "$choice" in
         1)
             echo " 即将卸载 Sing-box、Hysteria2 及相关文件..."
-            read -rp "确认继续? (y/N): " confirm
+            read -rp "确认继续 (y/N): " confirm
             [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
             # ======= 停止并禁用服务 =======
@@ -409,14 +409,14 @@ reinstall_menu() {
             SCRIPT_PATH="$0"
             rm -f "$SCRIPT_PATH"
 
-            echo "? Sing-box、Hysteria2 已完全卸载，脚本文件已删除"
+            echo " Sing-box、Hysteria2 已完全卸载，脚本文件已删除"
             exit 0
             ;;
         2)
             systemctl stop sing-box 2>/dev/null
             echo " 正在重新安装 Sing-box（保留节点配置）..."
             bash <(curl -fsSL https://sing-box.app/install.sh)
-            echo "? Sing-box 已重新安装完成（节点已保留）"
+            echo " Sing-box 已重新安装完成（节点已保留）"
             ;;
         0)
             return
@@ -532,17 +532,17 @@ system_check() {
     # 检查所有入站端口状态
     local any_issue=0
     local port
-    for port in $(jq -r '.inbounds[]?.listen_port' "$CONFIG" 2>/dev/null); do
+    for port in $(jq -r '.inbounds[].listen_port' "$CONFIG" 2>/dev/null); do
         [[ -z "$port" ]] && continue
         port_status "$port"
-        case $? in
+        case $ in
             0) : ;;
             1) warn "端口 $port 被其他进程占用"; any_issue=1 ;;
             2) warn "端口 $port 未监听"; any_issue=1 ;;
         esac
     done
     local dup_ports
-    dup_ports=$(jq -r '.inbounds[]?.listen_port' "$CONFIG" 2>/dev/null | sort | uniq -d)
+    dup_ports=$(jq -r '.inbounds[].listen_port' "$CONFIG" 2>/dev/null | sort | uniq -d)
     if [[ -n "$dup_ports" ]]; then
         err "配置文件端口冲突: $(echo "$dup_ports" | xargs)"
         any_issue=1
@@ -609,7 +609,7 @@ fix_errors() {
             if [[ ! -f /etc/hysteria2/${port}.crt || ! -f /etc/hysteria2/${port}.key ]]; then
                 openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria2/${port}.key 2>/dev/null || \
                     openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out /etc/hysteria2/${port}.key 2>/dev/null
-                if [[ $? -ne 0 ]]; then
+                if [[ $ -ne 0 ]]; then
                     err "端口 $port 私钥生成失败"
                 else
                     openssl req -new -x509 -nodes -key /etc/hysteria2/${port}.key -out /etc/hysteria2/${port}.crt -subj "/CN=bing.com" -days 36500 >/dev/null 2>&1 || \
@@ -668,7 +668,7 @@ add_node() {
       if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then
         warn "端口无效"; continue
       fi
-      if jq -e --argjson p "$PORT" '.inbounds[]? | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
+      if jq -e --argjson p "$PORT" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
         warn "端口 $PORT 已存在，请换一个。"
         continue
       fi
@@ -701,30 +701,30 @@ add_node() {
 
     tmpcfg=$(mktemp)
     jq --arg port "$PORT" \
-       --arg uuid "$UUID" \
-       --arg prikey "$PRIVATE_KEY" \
-       --arg sid "$SHORT_ID" \
-       --arg server "$SERVER_NAME" \
-       --arg fp "$FP" \
-       --arg flow "$FLOW" \
-       --arg tag "$TAG" \
-       '.inbounds += [{
-         "type": "vless",
-         "tag": $tag,
-         "listen": "0.0.0.0",
-         "listen_port": ($port | tonumber),
-         "users": [{ "uuid": $uuid, "flow": $flow }],
-         "tls": {
-           "enabled": true,
-           "server_name": $server,
-           "reality": {
-             "enabled": true,
-             "handshake": { "server": $server, "server_port": 443 },
-             "private_key": $prikey,
-             "short_id": [ $sid ]
-           }
-         }
-       }]' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
+   --arg uuid "$UUID" \
+   --arg prikey "$PRIVATE_KEY" \
+   --arg sid "$SHORT_ID" \
+   --arg server "$SERVER_NAME" \
+   --arg fp "$FP" \
+   --arg flow "$FLOW" \
+   --arg tag "$TAG" \
+   '.inbounds += [{
+     "type": "vless",
+     "tag": $tag,
+     "listen": "::",
+     "listen_port": ($port | tonumber),
+     "users": [{ "uuid": $uuid, "flow": $flow }],
+     "tls": {
+       "enabled": true,
+       "server_name": $server,
+       "reality": {
+         "enabled": true,
+         "handshake": { "server": $server, "server_port": 443 },
+         "private_key": $prikey,
+         "short_id": [ $sid ]
+       }
+     }
+   }]' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
 
     say " 正在校验配置..."
     if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
@@ -753,7 +753,7 @@ add_node() {
     say "TAG: $TAG"
     say ""
     say " 客户端链接："
-    say "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
+    say "vless://${UUID}@${IPV4}:${PORT}encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
     say ""
     return
   else
@@ -769,7 +769,7 @@ add_node() {
       if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then 
         warn "端口无效"; continue
       fi
-      if jq -e --argjson p "$PORT" '.inbounds[]? | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
+      if jq -e --argjson p "$PORT" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
         warn "端口 $PORT 已存在，请换一个。"; continue
       fi
       break
@@ -827,11 +827,11 @@ add_hysteria2_node() {
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then
       warn "端口无效"; continue
     fi
-    if jq -e --argjson p "$PORT" '.inbounds[]? | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
+    if jq -e --argjson p "$PORT" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
       warn "端口 $PORT 已存在，请换一个。"
       continue
     fi
-    if jq -e --arg p "$PORT" 'to_entries[]? | select(.value.type=="hysteria2" and (.value.port|tostring == $p))' "$META" >/dev/null 2>&1; then
+    if jq -e --arg p "$PORT" 'to_entries[] | select(.value.type=="hysteria2" and (.value.port|tostring == $p))' "$META" >/dev/null 2>&1; then
       warn "端口 $PORT 已存在，请换一个。"
       continue
     fi
@@ -878,7 +878,7 @@ add_hysteria2_node() {
 
   # 生成唯一 TAG
   local TAG="hysteria2-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
-  if jq -e --arg t "$TAG" '.inbounds[]? | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1 || jq -e --arg t "$TAG" 'has($t)' "$META" >/dev/null 2>&1; then
+  if jq -e --arg t "$TAG" '.inbounds[] | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1 || jq -e --arg t "$TAG" 'has($t)' "$META" >/dev/null 2>&1; then
     TAG="hysteria2-$(get_country_code)-$(date +%s)"
   fi
 
@@ -955,10 +955,10 @@ systemctl restart hysteria2-${PORT}.service >/dev/null 2>&1 || true
   say ""
   say " 客户端链接："
   if [[ -n "$IPV4" ]]; then
-    say "hysteria2://${AUTH_PWD}@${IPV4}:${PORT}?obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
+    say "hysteria2://${AUTH_PWD}@${IPV4}:${PORT}obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
   fi
   if [[ -n "$IPV6" ]]; then
-    say "hysteria2://${AUTH_PWD}@[${IPV6}]:${PORT}?obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
+    say "hysteria2://${AUTH_PWD}@[${IPV6}]:${PORT}obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
   fi
   say ""
 }
@@ -999,7 +999,7 @@ view_nodes() {
 
     # 检查端口状态
     port_status "$PORT"
-    case $? in
+    case $ in
       0) : ;; # 正常监听，不显示警告
       1) warn "端口 $PORT 被其他进程占用" ;;
       2) warn "端口 $PORT 未监听" ;;
@@ -1018,7 +1018,7 @@ view_nodes() {
       [[ -z "$SID" || "$SID" == "null" ]] && SID=$(jq -r '.tls.reality.short_id[0] // empty' <<<"$json")
       # 生成客户端链接
       if [[ -n "$PBK" && -n "$SID" && -n "$SERVER_NAME" ]]; then
-        say "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${PBK}&sid=${SID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
+        say "vless://${UUID}@${IPV4}:${PORT}encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${PBK}&sid=${SID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
       else
         warn "节点参数不完整，无法生成链接"
       fi
@@ -1047,7 +1047,7 @@ view_nodes() {
       say "[$idx] 端口: $PORT | 协议: $TYPE | 名称: $TAG"
       if [[ "$TYPE" != "hysteria2" ]]; then
         port_status "$PORT"
-        case $? in
+        case $ in
           0) : ;;
           1) warn "端口 $PORT 被其他进程占用" ;;
           2) warn "端口 $PORT 未监听" ;;
@@ -1057,8 +1057,8 @@ view_nodes() {
       OBFS=$(jq -r --arg t "$TAG" '.[$t].obfs // empty' "$META")
       SNI=$(jq -r --arg t "$TAG" '.[$t].sni // empty' "$META")
       if [[ -n "$AUTH" && -n "$OBFS" && -n "$SNI" ]]; then
-        say "hysteria2://${AUTH}@${IPV4}:${PORT}?obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
-        [[ -n "$IPV6" ]] && say "hysteria2://${AUTH}@[${IPV6}]:${PORT}?obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
+        say "hysteria2://${AUTH}@${IPV4}:${PORT}obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
+        [[ -n "$IPV6" ]] && say "hysteria2://${AUTH}@[${IPV6}]:${PORT}obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
       else
         warn "节点参数不完整，无法生成链接"
       fi
