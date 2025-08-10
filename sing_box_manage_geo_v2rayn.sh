@@ -404,6 +404,246 @@ reinstall_menu() {
             ;;
     esac
 }
+# ---------------------- 系统检测与修复 ----------------------
+diagnose_menu() {
+    echo "====== 系统检测与修复 ======"
+    echo "1) 系统检测"
+    echo "2) 修复错误"
+    echo "0) 返回主菜单"
+    read -rp "请选择: " opt
+    case "$opt" in
+        1)
+            system_check
+            ;;
+        2)
+            fix_errors
+            ok "修复操作已完成，正在重新检测..."
+            system_check
+            echo ""
+            warn "如 Sing-box 服务仍无法启动，请运行 'journalctl -u sing-box -e' 查看错误日志"
+            warn "如 config.json 配置有误，请执行 'sing-box check -c $CONFIG' 检查并修正"
+            warn "如端口冲突或被占用，请修改配置端口或停止冲突进程 (使用 lsof -i:<端口号> 查看占用)"
+            warn "如 Hysteria2 证书缺失，请确保 /etc/hysteria2/<端口>.crt 和 .key 文件存在，必要时重新生成证书"
+            warn "如依赖未自动安装成功，请手动安装 curl、jq、uuidgen、openssl、lsof、ss"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            warn "无效输入"
+            ;;
+    esac
+}
+
+system_check() {
+    if command -v sing-box >/dev/null 2>&1; then
+        ok "sing-box 已安装"
+    else
+        err "sing-box 未安装"
+    fi
+
+    local init; init=$(detect_init_system)
+    if [[ "$init" == "systemd" ]]; then
+        if systemctl is-active --quiet sing-box; then
+            ok "Sing-box 服务正在运行"
+        else
+            if ! systemctl status sing-box >/dev/null 2>&1; then
+                err "Sing-box 服务未配置 (systemd)"
+            elif systemctl is-failed --quiet sing-box; then
+                err "Sing-box 服务启动失败"
+            else
+                err "Sing-box 服务未运行"
+            fi
+        fi
+    elif [[ "$init" == "openrc" ]]; then
+        if rc-service sing-box status 2>/dev/null | grep -q started; then
+            ok "Sing-box 服务正在运行 (OpenRC)"
+        else
+            if [[ -f /etc/init.d/sing-box ]]; then
+                err "Sing-box 服务未运行 (OpenRC)"
+            else
+                err "Sing-box 服务未配置 (OpenRC)"
+            fi
+        fi
+    else
+        if pgrep -x sing-box >/dev/null 2>&1; then
+            ok "Sing-box 进程正在运行"
+        else
+            err "Sing-box 进程未运行"
+        fi
+    fi
+
+    # 检查 Hysteria2 服务状态
+    local hyst_found=0
+    shopt -s nullglob
+    for f in /etc/systemd/system/hysteria2*.service; do
+        hyst_found=1
+        local name=$(basename "$f")
+        local port=${name#hysteria2-}; port=${port%.service}
+        if systemctl is-active --quiet "$name"; then
+            ok "Hysteria2-${port} 服务运行中"
+        else
+            if systemctl is-failed --quiet "$name"; then
+                err "Hysteria2-${port} 服务启动失败"
+            else
+                err "Hysteria2-${port} 服务未运行"
+            fi
+        fi
+    done
+    shopt -u nullglob
+    if [[ $hyst_found -eq 0 ]]; then
+        ok "Hysteria2 服务未启用"
+    fi
+
+    # 检查配置文件合法性
+    if command -v sing-box >/dev/null 2>&1; then
+        if ! sing-box check -c "$CONFIG" >/dev/null 2>&1; then
+            err "配置文件 $(basename "$CONFIG") 不合法"
+        else
+            ok "配置文件合法"
+        fi
+    else
+        warn "无法验证配置文件 (sing-box 未安装)"
+    fi
+
+    # 检查所有入站端口状态
+    local any_issue=0
+    local port
+    for port in $(jq -r '.inbounds[]?.listen_port' "$CONFIG" 2>/dev/null); do
+        [[ -z "$port" ]] && continue
+        port_status "$port"
+        case $? in
+            0) : ;;
+            1) warn "端口 $port 被其他进程占用"; any_issue=1 ;;
+            2) warn "端口 $port 未监听"; any_issue=1 ;;
+        esac
+    done
+    local dup_ports
+    dup_ports=$(jq -r '.inbounds[]?.listen_port' "$CONFIG" 2>/dev/null | sort | uniq -d)
+    if [[ -n "$dup_ports" ]]; then
+        err "配置文件端口冲突: $(echo "$dup_ports" | xargs)"
+        any_issue=1
+    fi
+    if [[ $any_issue -eq 0 ]]; then
+        ok "所有入站端口监听正常"
+    fi
+
+    # 检查依赖项是否存在
+    local missing=()
+    for cmd in curl jq uuidgen openssl lsof ss; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if ((${#missing[@]} > 0)); then
+        err "缺少依赖: ${missing[*]}"
+    else
+        ok "依赖项齐全 (curl/jq/uuidgen/openssl/lsof/ss)"
+    fi
+}
+
+fix_errors() {
+    # 自动安装缺失的依赖
+    install_dependencies
+
+    # 自动安装 sing-box（如果未安装）
+    install_singbox_if_needed || true
+
+    # 修复 sing-box 服务配置并启动服务
+    local init; init=$(detect_init_system)
+    if [[ "$init" == "systemd" ]]; then
+        if [[ ! -f /etc/systemd/system/sing-box.service ]]; then
+            ensure_service_systemd
+            ok "已配置 Sing-box systemd 服务"
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now sing-box >/dev/null 2>&1 || systemctl restart sing-box >/dev/null 2>&1 || true
+        if systemctl is-active --quiet sing-box; then
+            ok "Sing-box 服务已启动"
+        else
+            err "Sing-box 服务仍未运行"
+        fi
+    elif [[ "$init" == "openrc" ]]; then
+        if [[ ! -f /etc/init.d/sing-box ]]; then
+            ensure_service_openrc
+            ok "已配置 Sing-box OpenRC 服务"
+        fi
+        rc-update add sing-box default >/dev/null 2>&1 || true
+        rc-service sing-box restart >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || true
+        if rc-service sing-box status 2>/dev/null | grep -q started; then
+            ok "Sing-box 服务已启动 (OpenRC)"
+        else
+            err "Sing-box 服务仍未运行 (OpenRC)"
+        fi
+    else
+        if ! pgrep -x sing-box >/dev/null 2>&1; then
+            nohup sing-box run -c "$CONFIG" >/var/log/sing-box.log 2>&1 &
+            sleep 1
+        fi
+        if pgrep -x sing-box >/dev/null 2>&1; then
+            ok "Sing-box 进程已启动"
+        else
+            err "Sing-box 进程启动失败"
+        fi
+    fi
+
+    # 修复 Hysteria2 服务
+    local need_hy_install=0
+    shopt -s nullglob
+    for f in /etc/systemd/system/hysteria2*.service; do
+        if ! command -v hysteria >/dev/null 2>&1; then
+            need_hy_install=1
+            break
+        fi
+    done
+    if [[ $need_hy_install -eq 1 ]]; then
+        local H_VERSION="2.6.2"
+        local arch=$(uname -m)
+        case "$arch" in
+            x86_64|amd64) arch="amd64" ;;
+            aarch64|arm64) arch="arm64" ;;
+            *) err "暂不支持的架构：$arch" ;;
+        esac
+        local tmp; tmp=$(mktemp -d)
+        (
+            set -e
+            cd "$tmp"
+            curl -sSL "https://github.com/apernet/hysteria/releases/download/app/v${H_VERSION}/hysteria-linux-${arch}" -o hysteria-bin || { err "下载 hysteria 失败"; exit 1; }
+            install -m 0755 hysteria-bin /usr/local/bin/hysteria
+        ) || true
+        rm -rf "$tmp"
+        if command -v hysteria >/dev/null 2>&1; then
+            ok "hysteria 安装完成"
+        fi
+    fi
+
+    for f in /etc/systemd/system/hysteria2*.service; do
+        local name=$(basename "$f")
+        local port=${name#hysteria2-}; port=${port%.service}
+        if ! systemctl is-active --quiet "$name"; then
+            if [[ ! -f /etc/hysteria2/${port}.crt || ! -f /etc/hysteria2/${port}.key ]]; then
+                openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria2/${port}.key 2>/dev/null || \
+                    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out /etc/hysteria2/${port}.key 2>/dev/null
+                if [[ $? -ne 0 ]]; then
+                    err "端口 $port 私钥生成失败"
+                else
+                    openssl req -new -x509 -nodes -key /etc/hysteria2/${port}.key -out /etc/hysteria2/${port}.crt -subj "/CN=bing.com" -days 36500 >/dev/null 2>&1 || \
+                        err "端口 $port 证书生成失败"
+                fi
+                if [[ -f /etc/hysteria2/${port}.crt && -f /etc/hysteria2/${port}.key ]]; then
+                    ok "已重新生成端口 $port 证书"
+                fi
+            fi
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl restart "$name" >/dev/null 2>&1 || true
+            sleep 1
+            if systemctl is-active --quiet "$name"; then
+                ok "Hysteria2-${port} 服务已启动"
+            else
+                err "Hysteria2-${port} 服务仍无法启动"
+            fi
+        fi
+    done
+    shopt -u nullglob
+}
 
 # ---------------------- 节点操作 ----------------------
 add_node() {
@@ -458,10 +698,7 @@ add_node() {
     # 指纹随机
     case $((RANDOM%5)) in
       0) FP="chrome";;
-      1) FP="firefox";;
-      2) FP="safari";;
-      3) FP="ios";;
-      *) FP="android";;
+      *) FP="firefox";;
     esac
 
     KEY_PAIR=$(sing-box generate reality-keypair 2>/dev/null)
@@ -941,13 +1178,14 @@ show_version_info() {
 main_menu() {
   say ""
   show_version_info
-  say "============= 嘻嘻哈哈 节点管理工具（IPv4 + IPv6） ============="
+  say "============= Sing-box 节点管理工具（IPv4 + IPv6） ============="
   say "1) 添加节点"
   say "2) 查看所有节点"
   say "3) 删除用户（通过序号）"
   say "4) 检查并更新 Sing-box 到最新版"
   say "5) 重启 Sing-box 服务"
   say "6) 完全卸载 / 重装"
+  say "0) 系统检测与修复"
   say "9) 退出"
   say "==============================================================="
   read -rp "请输入操作编号: " CHOICE
@@ -958,6 +1196,7 @@ main_menu() {
     4) update_singbox ;;
     5) restart_singbox ;;
     6) reinstall_menu ;;
+	0) diagnose_menu ;;
     9) exit 0 ;;
     *) warn "无效输入" ;;
   esac
