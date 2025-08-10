@@ -61,6 +61,17 @@ install_singbox_if_needed() {
   if command -v sing-box >/dev/null 2>&1; then
     return 0
   fi
+
+  fix_ca_certificates() {
+    if [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
+      warn "检测到 CA 证书缺失，正在安装 ca-certificates..."
+      apt-get update -y
+      apt-get install --reinstall -y ca-certificates
+      update-ca-certificates
+      ok "CA 证书已修复"
+    fi
+  }
+
   warn "未检测到 sing-box，正在安装..."
   local VERSION="1.12.0"
   local arch=$(uname -m)
@@ -69,12 +80,22 @@ install_singbox_if_needed() {
     aarch64|arm64) arch="arm64" ;;
     *) err "暂不支持的架构：$arch"; return 1 ;;
   esac
+
+  fix_ca_certificates
+
   local tmp; tmp=$(mktemp -d)
   (
     set -e
     cd "$tmp"
-    curl -fsSLO "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${arch}.tar.gz"
-    tar -xzf "sing-box-${VERSION}-linux-${arch}.tar.gz"
+    local FILE="sing-box-${VERSION}-linux-${arch}.tar.gz"
+    local URL="https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/${FILE}"
+
+    if ! curl -fL -o "$FILE" "$URL"; then
+      warn "直连下载失败，尝试代理..."
+      curl -fL -o "$FILE" "https://ghproxy.com/${URL}"
+    fi
+
+    tar -xzf "$FILE"
     install -m 0755 "sing-box-${VERSION}-linux-${arch}/sing-box" /usr/local/bin/sing-box
   ) || { err "安装 sing-box 失败"; rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
@@ -114,6 +135,12 @@ get_ipv6_address() {
 # 修复后的 port_status 函数
 port_status() {
   local port="$1"
+
+  # 如果当前节点是 hysteria2，直接返回 0（正常）
+  if [[ "$protocol" == "hysteria2" ]]; then
+    return 0
+  fi
+
   # 0=sing-box监听, 1=其他进程占用, 2=未监听/无法检测
   if command -v lsof >/dev/null 2>&1; then
     local out
@@ -121,7 +148,7 @@ port_status() {
     if [[ -z "$out" ]]; then
       return 2
     fi
-    if echo "$out" | grep -Eq '^(sing-box|hysteria)$'; then
+    if echo "$out" | grep -Eq '^(sing-box)$'; then
       return 0
     else
       return 1
@@ -132,7 +159,7 @@ port_status() {
     if ! grep -q LISTEN <<<"$out"; then
       return 2
     fi
-    if grep -q 'users:(("sing-box"' <<<"$out" || grep -q 'users:(("hysteria"' <<<"$out"; then
+    if grep -q 'users:(("sing-box"' <<<"$out"; then
       return 0
     else
       return 1
@@ -271,6 +298,111 @@ ensure_autostart() {
       : # unknown init; skip
       ;;
   esac
+}
+update_singbox() {
+  say "📦📦 正在检查 Sing-box 更新..."
+  local CUR LATEST ARCH tmp
+  CUR=$(sing-box version 2>/dev/null | awk '/sing-box version/{print $3}')
+  say "当前版本: ${CUR:-未知}"
+  LATEST=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
+  if [[ -z "$LATEST" ]]; then warn "获取最新版本失败"; return; fi
+  say "最新版本: $LATEST"
+  [[ "$CUR" == "$LATEST" ]] && { ok "已是最新版"; return; }
+  read -rp "是否更新到 $LATEST？(y/N): " c; [[ "$c" == "y" ]] || { say "已取消"; return; }
+  ARCH=$(uname -m); case "$ARCH" in x86_64|amd64) ARCH="amd64";; aarch64|arm64) ARCH="arm64";; *) err "不支持架构 $ARCH"; return 1;; esac
+  tmp=$(mktemp -d)
+  (
+    set -e
+    cd "$tmp"
+    curl -fsSLO "https://github.com/SagerNet/sing-box/releases/download/v${LATEST}/sing-box-${LATEST}-linux-${ARCH}.tar.gz"
+    tar -xzf "sing-box-${LATEST}-linux-${ARCH}.tar.gz"
+    local init; init=$(detect_init_system)
+    [[ "$init" == "systemd" ]] && systemctl stop sing-box || true
+    [[ "$init" == "openrc"  ]] && rc-service sing-box stop >/dev/null 2>&1 || true
+    install -m 0755 "sing-box-${LATEST}-linux-${ARCH}/sing-box" /usr/local/bin/sing-box
+    [[ "$init" == "systemd" ]] && systemctl start sing-box || true
+    [[ "$init" == "openrc"  ]] && rc-service sing-box start >/dev/null 2>&1 || true
+  ) || { err "升级失败"; rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  ok "已成功升级为 v${LATEST}"
+}
+reinstall_menu() {
+    echo "====== 修复 / 重装 Sing-box ======"
+    echo "1) 完全卸载（清空所有服务）"
+    echo "2) 保留节点配置并重装 Sing-box"
+    echo "0) 返回主菜单"
+    read -rp "请选择: " choice
+    case "$choice" in
+        1)
+            echo "⚠️ 即将卸载 Sing-box、Hysteria2、uuidgen、openssl 及相关文件..."
+            read -rp "确认继续? (y/N): " confirm
+            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+
+            # ======= 停止并禁用服务 =======
+            systemctl stop sing-box 2>/dev/null
+            systemctl disable sing-box 2>/dev/null
+            # 停止并禁用所有 Hysteria2 实例
+            shopt -s nullglob
+            for f in /etc/systemd/system/hysteria2*.service; do
+                name=$(basename "$f")
+                systemctl stop "$name" 2>/dev/null || true
+                systemctl disable "$name" 2>/dev/null || true
+            done
+            shopt -u nullglob
+
+            # ======= 删除 systemd 单元 =======
+            rm -f /etc/systemd/system/sing-box.service
+            rm -f /lib/systemd/system/sing-box.service
+            rm -f /etc/systemd/system/hysteria2*.service
+            rm -f /lib/systemd/system/hysteria2*.service
+
+            # ======= 删除可执行文件 =======
+            rm -f /usr/local/bin/sing-box
+            rm -f /usr/bin/sing-box
+            rm -f /usr/local/bin/hysteria
+            rm -f /usr/bin/hysteria
+
+            # ======= 删除配置和缓存 =======
+            rm -rf /etc/sing-box
+            rm -rf /var/lib/sing-box
+            rm -rf /var/log/sing-box
+            rm -rf /tmp/sing-box*
+            rm -rf /etc/hysteria2
+            rm -rf /var/lib/hysteria2
+            rm -rf /var/log/hysteria2
+            rm -rf /tmp/hysteria2*
+
+            # ======= 删除元数据文件（如果有） =======
+            rm -f "$META"
+
+            # ======= 卸载 uuidgen/openssl =======
+            apt-get remove --purge -y uuid-runtime openssl
+            apt-get autoremove -y
+            apt-get clean
+
+            # ======= 刷新 systemd =======
+            systemctl daemon-reload
+
+            # ======= 删除当前脚本 =======
+            SCRIPT_PATH="$0"
+            rm -f "$SCRIPT_PATH"
+
+            echo "✅ Sing-box、Hysteria2、uuidgen、openssl 已完全卸载，脚本文件已删除"
+            exit 0
+            ;;
+        2)
+            systemctl stop sing-box 2>/dev/null
+            echo "📥 正在重新安装 Sing-box（保留节点配置）..."
+            bash <(curl -fsSL https://sing-box.app/install.sh)
+            echo "✅ Sing-box 已重新安装完成（节点已保留）"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo "无效选择"
+            ;;
+    esac
 }
 
 # ---------------------- 节点操作 ----------------------
@@ -448,8 +580,8 @@ add_node() {
     local IPV6; IPV6=$(get_ipv6_address)
     if [[ -n "$IPV4" ]]; then
       local CREDS; CREDS=$(printf "%s" "$USER:$PASS" | base64)
-      say "IPv4: socks://${CREDS}@${IPV4}:${PORT}#$TAG"
-      [[ -n "$IPV6" ]] && say "IPv6: socks://${CREDS}@[${IPV6}]:${PORT}#$TAG"
+      say "IPv4: socks://${CREDS}@${IPV4}:${PORT}#${TAG}"
+      [[ -n "$IPV6" ]] && say "IPv6: socks://${CREDS}@[${IPV6}]:${PORT}#${TAG}"
     else
       say "请使用 domain/IP 和端口连接 SOCKS5 节点 (用户名: $USER, 密码: $PASS)"
     fi
@@ -458,12 +590,6 @@ add_node() {
 }
 
 add_hysteria2_node() {
-  # 检查是否已存在 Hysteria2 节点
-  if systemctl is-active --quiet hysteria2; then
-    err "检测到 Hysteria2 服务正在运行，无法重复添加。"
-    return 1
-  fi
-
   local PORT
   while true; do
     read -rp "请输入端口号（留空自动随机 50000-59999；输入 0 返回）: " PORT
@@ -479,12 +605,15 @@ add_hysteria2_node() {
       warn "端口 $PORT 已存在，请换一个。"
       continue
     fi
+    if jq -e --arg p "$PORT" 'to_entries[]? | select(.value.type=="hysteria2" and (.value.port|tostring == $p))' "$META" >/dev/null 2>&1; then
+      warn "端口 $PORT 已存在，请换一个。"
+      continue
+    fi
     break
   done
 
   local DOMAIN
-  read -rp "请输入伪装域名（默认 bing.com）: " DOMAIN
-  DOMAIN=${DOMAIN:-bing.com}
+  DOMAIN="bing.com"
 
   # 安装 Hysteria2（如未安装）
   if ! command -v hysteria >/dev/null 2>&1; then
@@ -511,30 +640,28 @@ add_hysteria2_node() {
   mkdir -p /etc/hysteria2
 
   # 生成自签证书
-  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria2/server.key 2>/dev/null || \
-    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out /etc/hysteria2/server.key 2>/dev/null
-  openssl req -new -x509 -nodes -key /etc/hysteria2/server.key -out /etc/hysteria2/server.crt -subj "/CN=${DOMAIN}" -days 36500 >/dev/null 2>&1 || {
+  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria2/${PORT}.key 2>/dev/null || \
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out /etc/hysteria2/${PORT}.key 2>/dev/null
+  openssl req -new -x509 -nodes -key /etc/hysteria2/${PORT}.key -out /etc/hysteria2/${PORT}.crt -subj "/CN=${DOMAIN}" -days 36500 >/dev/null 2>&1 || {
     err "自签证书生成失败"; return 1; }
 
   # 生成密码
-  local DEFAULT_AUTH AUTH_PWD OBFS_PWD
-  DEFAULT_AUTH=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
-  read -rp "请输入验证密码（留空随机生成）: " AUTH_PWD
-  AUTH_PWD=${AUTH_PWD:-$DEFAULT_AUTH}
+  local AUTH_PWD OBFS_PWD
+  AUTH_PWD=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
   OBFS_PWD=$(openssl rand -base64 8 | tr -d '=+/' | cut -c1-8)
 
   # 生成唯一 TAG
   local TAG="hysteria2-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
-  if jq -e --arg t "$TAG" '.inbounds[]? | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1; then
+  if jq -e --arg t "$TAG" '.inbounds[]? | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1 || jq -e --arg t "$TAG" 'has($t)' "$META" >/dev/null 2>&1; then
     TAG="hysteria2-$(get_country_code)-$(date +%s)"
   fi
 
   # 写入配置文件
-  cat > /etc/hysteria2/server.yaml <<EOF
+  cat > /etc/hysteria2/${PORT}.yaml <<EOF
 listen: ":${PORT}"
 tls:
-  cert: /etc/hysteria2/server.crt
-  key: /etc/hysteria2/server.key
+  cert: /etc/hysteria2/${PORT}.crt
+  key: /etc/hysteria2/${PORT}.key
 obfs:
   type: salamander
   salamander:
@@ -551,7 +678,7 @@ masquerade:
 EOF
 
   # 创建 systemd 服务
-  cat > /etc/systemd/system/hysteria2.service <<EOF
+  cat > /etc/systemd/system/hysteria2-${PORT}.service <<EOF
 [Unit]
 Description=Hysteria2 Service
 After=network-online.target
@@ -559,7 +686,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria2/server.yaml
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria2/${PORT}.yaml
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576
@@ -570,13 +697,13 @@ EOF
 
   # 启动服务
   systemctl daemon-reload
-  systemctl enable --now hysteria2 >/dev/null 2>&1 || true
+  systemctl enable --now hysteria2-${PORT} >/dev/null 2>&1 || true
 
   sleep 1
-  if systemctl is-active --quiet hysteria2; then
+  if systemctl is-active --quiet hysteria2-${PORT}; then
     ok "Hysteria2 服务已启动"
   else
-    err "Hysteria2 服务启动失败，请检查日志 (journalctl -u hysteria2)"
+    err "Hysteria2 服务启动失败，请检查日志 (journalctl -u hysteria2-${PORT})"
     return 1
   fi
 
@@ -674,8 +801,8 @@ view_nodes() {
       USER=$(jq -r '.users[0].username' <<<"$json")
       PASS=$(jq -r '.users[0].password' <<<"$json")
       ENCODED=$(printf "%s" "$USER:$PASS" | base64)
-      say "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#$TAG"
-      [[ -n "$IPV6" ]] && say "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#$TAG"
+      say "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#${TAG}"
+      [[ -n "$IPV6" ]] && say "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#${TAG}"
     fi
 
     say "---------------------------------------------------"
@@ -690,12 +817,14 @@ view_nodes() {
       PORT=$(jq -r --arg t "$TAG" '.[$t].port // empty' "$META")
       TYPE="hysteria2"
       say "[$idx] 端口: $PORT | 协议: $TYPE | 名称: $TAG"
-      port_status "$PORT"
-      case $? in
-        0) : ;;
-        1) warn "端口 $PORT 被其他进程占用" ;;
-        2) warn "端口 $PORT 未监听" ;;
-      esac
+      if [[ "$TYPE" != "hysteria2" ]]; then
+        port_status "$PORT"
+        case $? in
+          0) : ;;
+          1) warn "端口 $PORT 被其他进程占用" ;;
+          2) warn "端口 $PORT 未监听" ;;
+        esac
+      fi
       AUTH=$(jq -r --arg t "$TAG" '.[$t].auth // empty' "$META")
       OBFS=$(jq -r --arg t "$TAG" '.[$t].obfs // empty' "$META")
       SNI=$(jq -r --arg t "$TAG" '.[$t].sni // empty' "$META")
@@ -729,8 +858,14 @@ delete_node() {
     local tmpcfg; tmpcfg=$(mktemp)
     jq '.inbounds = []' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
     printf '{}' >"$META"
-    systemctl disable --now hysteria2 >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/hysteria2.service
+    # 停止并禁用所有 Hysteria2 实例
+    shopt -s nullglob
+    for f in /etc/systemd/system/hysteria2*.service; do
+      name=$(basename "$f")
+      systemctl disable --now "$name" >/dev/null 2>&1 || true
+      rm -f "$f"
+    done
+    shopt -u nullglob
     systemctl daemon-reload || true
     rm -rf /etc/hysteria2
     ok "所有节点已删除"; return
@@ -742,15 +877,37 @@ delete_node() {
     local ext_index=$((idx0 - COUNT))
     local tag_to_delete; tag_to_delete=$(jq -r --argjson i "$ext_index" 'to_entries | map(select(.value.type=="hysteria2")) | .[$i].key // empty' "$META")
     if [[ -n "$tag_to_delete" && "$tag_to_delete" != "null" ]]; then
+      local port_del
+      port_del=$(jq -r --arg t "$tag_to_delete" '.[$t].port // empty' "$META")
+      # 删除对应元数据
       local tmpmeta; tmpmeta=$(mktemp)
       jq "del(.\"$tag_to_delete\")" "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
+      # 停止并移除对应服务
+      if [[ -f "/etc/systemd/system/hysteria2-${port_del}.service" ]]; then
+        systemctl disable --now "hysteria2-${port_del}" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/hysteria2-${port_del}.service"
+      else
+        systemctl disable --now hysteria2 >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/hysteria2.service
+        rm -f /lib/systemd/system/hysteria2.service
+      fi
+      systemctl daemon-reload || true
+      # 删除配置文件和证书
+      if [[ -f "/etc/hysteria2/${port_del}.yaml" ]]; then
+        rm -f "/etc/hysteria2/${port_del}.yaml" "/etc/hysteria2/${port_del}.key" "/etc/hysteria2/${port_del}.crt"
+      else
+        rm -f /etc/hysteria2/server.yaml /etc/hysteria2/server.key /etc/hysteria2/server.crt
+      fi
+      ok "已删除节点 [$IDX]"
+      return
+    else
+      systemctl disable --now hysteria2 >/dev/null 2>&1 || true
+      rm -f /etc/systemd/system/hysteria2.service
+      systemctl daemon-reload || true
+      rm -f /etc/hysteria2/server.yaml /etc/hysteria2/server.key /etc/hysteria2/server.crt
+      ok "已删除节点 [$IDX]"
+      return
     fi
-    systemctl disable --now hysteria2 >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/hysteria2.service
-    systemctl daemon-reload || true
-    rm -rf /etc/hysteria2
-    ok "已删除节点 [$IDX]"
-    return
   fi
   local tag; tag=$(jq -r ".inbounds[$idx0].tag // empty" "$CONFIG")
   local tmpcfg; tmpcfg=$(mktemp)
@@ -763,13 +920,20 @@ delete_node() {
 }
 
 show_version_info() {
+  local OS OS_NAME
+  OS=$(detect_os)
+  if [[ "$OS" == "unknown" ]]; then
+    OS_NAME="未知"
+  else
+    OS_NAME="${OS^}"
+  fi
   if command -v sing-box >/dev/null 2>&1; then
     local VER ENV
     VER=$(sing-box version 2>/dev/null | awk '/sing-box version/{print $3}')
     ENV=$(sing-box version 2>/dev/null | awk -F'Environment: ' '/Environment:/{print $2}')
-    say "Sing-box 版本: ${VER:-未知}  | 架构: ${ENV:-未知}"
+    say "Sing-box 版本: ${VER:-未知}  | 架构: ${ENV:-未知}  | 系统: ${OS_NAME}"
   else
-    say "Sing-box 版本: 未知  | 架构: 未知"
+    say "Sing-box 版本: 未知  | 架构: 未知  | 系统: ${OS_NAME}"
   fi
 }
 
@@ -783,7 +947,7 @@ main_menu() {
   say "3) 删除用户（通过序号）"
   say "4) 检查并更新 Sing-box 到最新版"
   say "5) 重启 Sing-box 服务"
-  say "6) 修复 / 重装（完全卸载 / 保留节点重装）"
+  say "6) 完全卸载 / 重装"
   say "9) 退出"
   say "==============================================================="
   read -rp "请输入操作编号: " CHOICE
