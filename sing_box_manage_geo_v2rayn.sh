@@ -376,8 +376,6 @@ reinstall_menu() {
             rm -f "$META"
 
             # ======= 卸载 uuidgen/openssl =======
-            apt-get remove --purge -y uuid-runtime openssl
-            apt-get autoremove -y
             apt-get clean
 
             # ======= 刷新 systemd =======
@@ -387,7 +385,7 @@ reinstall_menu() {
             SCRIPT_PATH="$0"
             rm -f "$SCRIPT_PATH"
 
-            echo "✅ Sing-box、Hysteria2、uuidgen、openssl 已完全卸载，脚本文件已删除"
+            echo "✅ Sing-box、Hysteria2 已完全卸载，脚本文件已删除"
             exit 0
             ;;
         2)
