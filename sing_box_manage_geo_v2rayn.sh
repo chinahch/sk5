@@ -10,9 +10,9 @@ CONFIG="/etc/sing-box/config.json"
 META="/etc/sing-box/nodes_meta.json"
 
 say() { printf "%s\n" "$*"; }
-err() { printf "❌❌ %s\n" "$*" >&2; }
-ok()  { printf "✅ %s\n" "$*"; }
-warn(){ printf "⚠️ %s\n" "$*"; }
+err() { printf " %s\n" "$*" >&2; }
+ok()  { printf "? %s\n" "$*"; }
+warn(){ printf " %s\n" "$*"; }
 
 # ---------------------- 工具函数 ----------------------
 detect_os() {
@@ -169,36 +169,7 @@ port_status() {
   fi
 }
 
-# ---------------------- 服务自启动（稳定实现） ----------------------
-ensure_service_systemd() {
-  cat <<'EOF' >/etc/systemd/system/sing-box.service
-[Unit]
-Description=Sing-box Service
-After=network-online.target
-Wants=network-online.target
 
-[Service]
-Type=simple
-ExecStart=/bin/sh -c '\
-  /usr/local/bin/sing-box check -c /etc/sing-box/config.json || { echo "config check failed"; exit 1; }; \
-  exec /usr/local/bin/sing-box run -c /etc/sing-box/config.json \
-'
-Restart=on-failure
-RestartSec=1s
-StartLimitIntervalSec=30
-StartLimitBurst=10
-
-TimeoutStartSec=10s
-TimeoutStopSec=5s
-KillMode=mixed
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload || true
-  systemctl enable --now sing-box >/dev/null 2>&1 || true
-}
 
 ensure_service_openrc() {
   cat <<'EOF' >/etc/init.d/sing-box
@@ -267,6 +238,11 @@ restart_singbox() {
     fi
   elif [[ "$init" == "openrc" ]]; then
     timeout 8s rc-service sing-box stop >/dev/null 2>&1 || true
+    # 强制终止可能残留的 sing-box 进程，避免端口占用
+    pids=$(pgrep -x sing-box) || true
+    if [[ -n "$pids" ]]; then
+      for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+    fi
     sleep 0.4
     timeout 8s rc-service sing-box start >/dev/null 2>&1 || true
     sleep 1
@@ -274,33 +250,80 @@ restart_singbox() {
       ok "Sing-box 重启完成（OpenRC）"
     else
       err "Sing-box 重启失败（OpenRC）"
+      tail -n 80 /var/log/sing-box.log 2>/dev/null || true
       return 1
     fi
   else
-    warn "未检测到受支持的服务管理器，将直接拉起后台进程"
+    warn "未检测到受支持的服务管理器，将后台启动 Sing-box 进程"
+    # 强制终止可能残留的 sing-box 进程，避免端口占用
+    pids=$(pgrep -x sing-box) || true
+    if [[ -n "$pids" ]]; then
+      for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+    fi
+    # 启动前验证配置有效性
+    if ! /usr/local/bin/sing-box check -c "$CONFIG" >/dev/null 2>&1; then
+      err "配置文件校验失败，无法重启 Sing-box，请检查 $CONFIG"
+      sing-box check -c "$CONFIG"
+      return 1
+    fi
+    # 后台启动 Sing-box 进程
     nohup /usr/local/bin/sing-box run -c "$CONFIG" >/var/log/sing-box.log 2>&1 &
-    sleep 1
+    local SING_PID=$!
+    local ok_flag=0 i any_listen
+    for i in {1..60}; do
+      any_listen=$(jq -r '.inbounds[]?.listen_port' "$CONFIG" 2>/dev/null | while read -r p; do
+        [[ -z "$p" ]] && continue
+        if ss -ltnp 2>/dev/null | grep -q ":$p "; then echo ok; break; fi
+        if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/$p" >/dev/null 2>&1; then echo ok; break; fi
+      done)
+      if [[ "$any_listen" == "ok" ]]; then
+        ok_flag=1
+        break
+      fi
+      if kill -0 "$SING_PID" 2>/dev/null; then
+        sleep 0.5
+      else
+        break
+      fi
+    done
+    if [[ $ok_flag -eq 1 ]]; then
+      ok "Sing-box 重启完成（进程已启动）"
+    else
+      err "Sing-box 重启失败（未检测到端口监听/进程未运行）"
+      tail -n 80 /var/log/sing-box.log 2>/dev/null || true
+      return 1
+    fi
   fi
 }
+install_systemd_service() {
+    local SERVICE_FILE="/lib/systemd/system/sing-box.service"
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Sing-box Service
+After=network-online.target
+Wants=network-online.target
 
-ensure_autostart() {
-  case "$(detect_init_system)" in
-    systemd)
-      ensure_service_systemd
-      systemctl enable --now sing-box 2>/dev/null || systemctl restart sing-box 2>/dev/null || true
-      ;;
-    openrc)
-      ensure_service_openrc
-      rc-update add sing-box default >/dev/null 2>&1 || true
-      rc-service sing-box restart >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || true
-      ;;
-    *)
-      : # unknown init; skip
-      ;;
-  esac
+[Service]
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+
+    echo "已安装并启用 systemd 自启动服务：sing-box"
 }
+
+# 调用
+install_systemd_service
+
 update_singbox() {
-  say "📦📦 正在检查 Sing-box 更新..."
+  say " 正在检查 Sing-box 更新..."
   local CUR LATEST ARCH tmp
   CUR=$(sing-box version 2>/dev/null | awk '/sing-box version/{print $3}')
   say "当前版本: ${CUR:-未知}"
@@ -326,6 +349,7 @@ update_singbox() {
   rm -rf "$tmp"
   ok "已成功升级为 v${LATEST}"
 }
+
 reinstall_menu() {
     echo "====== 修复 / 重装 Sing-box ======"
     echo "1) 完全卸载（清空所有服务）"
@@ -334,7 +358,7 @@ reinstall_menu() {
     read -rp "请选择: " choice
     case "$choice" in
         1)
-            echo "⚠️ 即将卸载 Sing-box、Hysteria2、uuidgen、openssl 及相关文件..."
+            echo " 即将卸载 Sing-box、Hysteria2 及相关文件..."
             read -rp "确认继续? (y/N): " confirm
             [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
@@ -385,14 +409,14 @@ reinstall_menu() {
             SCRIPT_PATH="$0"
             rm -f "$SCRIPT_PATH"
 
-            echo "✅ Sing-box、Hysteria2 已完全卸载，脚本文件已删除"
+            echo "? Sing-box、Hysteria2 已完全卸载，脚本文件已删除"
             exit 0
             ;;
         2)
             systemctl stop sing-box 2>/dev/null
-            echo "📥 正在重新安装 Sing-box（保留节点配置）..."
+            echo " 正在重新安装 Sing-box（保留节点配置）..."
             bash <(curl -fsSL https://sing-box.app/install.sh)
-            echo "✅ Sing-box 已重新安装完成（节点已保留）"
+            echo "? Sing-box 已重新安装完成（节点已保留）"
             ;;
         0)
             return
@@ -423,6 +447,7 @@ diagnose_menu() {
             warn "如端口冲突或被占用，请修改配置端口或停止冲突进程 (使用 lsof -i:<端口号> 查看占用)"
             warn "如 Hysteria2 证书缺失，请确保 /etc/hysteria2/<端口>.crt 和 .key 文件存在，必要时重新生成证书"
             warn "如依赖未自动安装成功，请手动安装 curl、jq、uuidgen、openssl、lsof、ss"
+            warn "如未使用 systemd，可通过查看 /var/log/sing-box.log 获取 Sing-box 日志输出"
             ;;
         0)
             return
@@ -545,44 +570,8 @@ fix_errors() {
     # 自动安装 sing-box（如果未安装）
     install_singbox_if_needed || true
 
-    # 修复 sing-box 服务配置并启动服务
-    local init; init=$(detect_init_system)
-    if [[ "$init" == "systemd" ]]; then
-        if [[ ! -f /etc/systemd/system/sing-box.service ]]; then
-            ensure_service_systemd
-            ok "已配置 Sing-box systemd 服务"
-        fi
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable --now sing-box >/dev/null 2>&1 || systemctl restart sing-box >/dev/null 2>&1 || true
-        if systemctl is-active --quiet sing-box; then
-            ok "Sing-box 服务已启动"
-        else
-            err "Sing-box 服务仍未运行"
-        fi
-    elif [[ "$init" == "openrc" ]]; then
-        if [[ ! -f /etc/init.d/sing-box ]]; then
-            ensure_service_openrc
-            ok "已配置 Sing-box OpenRC 服务"
-        fi
-        rc-update add sing-box default >/dev/null 2>&1 || true
-        rc-service sing-box restart >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || true
-        if rc-service sing-box status 2>/dev/null | grep -q started; then
-            ok "Sing-box 服务已启动 (OpenRC)"
-        else
-            err "Sing-box 服务仍未运行 (OpenRC)"
-        fi
-    else
-        if ! pgrep -x sing-box >/dev/null 2>&1; then
-            nohup sing-box run -c "$CONFIG" >/var/log/sing-box.log 2>&1 &
-            sleep 1
-        fi
-        if pgrep -x sing-box >/dev/null 2>&1; then
-            ok "Sing-box 进程已启动"
-        else
-            err "Sing-box 进程启动失败"
-        fi
-    fi
-
+    # 统一用 systemd 启动 sing-box
+    install_systemd_service
     # 修复 Hysteria2 服务
     local need_hy_install=0
     shopt -s nullglob
@@ -628,6 +617,7 @@ fix_errors() {
                 fi
                 if [[ -f /etc/hysteria2/${port}.crt && -f /etc/hysteria2/${port}.key ]]; then
                     ok "已重新生成端口 $port 证书"
+                endif
                 fi
             fi
             systemctl daemon-reload >/dev/null 2>&1 || true
@@ -736,7 +726,7 @@ add_node() {
          }
        }]' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
 
-    say "🧪🧪 正在校验配置..."
+    say " 正在校验配置..."
     if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
       ok "配置通过，正在重启 Sing-box..."
       restart_singbox || { err "重启失败"; return 1; }
@@ -762,7 +752,7 @@ add_node() {
     say "Fingerprint: $FP"
     say "TAG: $TAG"
     say ""
-    say "👉 客户端链接："
+    say " 客户端链接："
     say "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
     say ""
     return
@@ -790,10 +780,11 @@ add_node() {
 
     tmpcfg=$(mktemp)
     jq --arg port "$PORT" --arg user "$USER" --arg pass "$PASS" --arg tag "$TAG" \
-      '.inbounds += [{"type":"socks","tag":$tag,"listen":"0.0.0.0","listen_port":($port|tonumber),"users":[{"username":$user,"password":$pass}]}]' \
-      "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
+  '.inbounds += [{"type":"socks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"users":[{"username":$user,"password":$pass}]}]' \
+  "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
 
-    say "🧪🧪 正在校验配置..."
+
+    say " 正在校验配置..."
     if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
       ok "配置通过，正在重启..."
       restart_singbox || { err "重启失败"; return 1; }
@@ -810,7 +801,7 @@ add_node() {
     say "密码: $PASS"
     say "TAG: $TAG"
     say ""
-    say "👉 客户端链接："
+    say " 客户端链接："
     local IPV4; IPV4=$(curl -s --max-time 2 https://api.ipify.org)
     local IPV6; IPV6=$(get_ipv6_address)
     if [[ -n "$IPV4" ]]; then
@@ -912,17 +903,17 @@ masquerade:
     insecure: true
 EOF
 
-  # 创建 systemd 服务
-  cat > /etc/systemd/system/hysteria2-${PORT}.service <<EOF
+ # 创建 systemd 服务
+ cat > /etc/systemd/system/hysteria2-${PORT}.service <<EOF
 [Unit]
-Description=Hysteria2 Service
+Description=Hysteria2 Service (${PORT})
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria2/${PORT}.yaml
-Restart=on-failure
+Restart=always
 RestartSec=3s
 LimitNOFILE=1048576
 
@@ -930,9 +921,11 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-  # 启动服务
-  systemctl daemon-reload
-  systemctl enable --now hysteria2-${PORT} >/dev/null 2>&1 || true
+# 让 systemd 重新加载配置，并设置开机自启（静默）
+systemctl daemon-reload >/dev/null 2>&1
+systemctl enable hysteria2-${PORT}.service >/dev/null 2>&1 || true
+systemctl restart hysteria2-${PORT}.service >/dev/null 2>&1 || true
+
 
   sleep 1
   if systemctl is-active --quiet hysteria2-${PORT}; then
@@ -960,7 +953,7 @@ EOF
   say "SNI域名: $DOMAIN"
   say "TAG: $TAG"
   say ""
-  say "👉 客户端链接："
+  say " 客户端链接："
   if [[ -n "$IPV4" ]]; then
     say "hysteria2://${AUTH_PWD}@${IPV4}:${PORT}?obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
   fi
@@ -1089,7 +1082,7 @@ delete_node() {
   read -rp "请输入要删除的节点序号 / all / 0: " IDX
   [[ "$IDX" == "0" || -z "$IDX" ]] && return
   if [[ "$IDX" == "all" ]]; then
-    read -rp "⚠️ 确认删除全部节点？(y/N): " c; [[ "$c" == "y" ]] || { say "已取消"; return; }
+    read -rp " 确认删除全部节点？(y/N): " c; [[ "$c" == "y" ]] || { say "已取消"; return; }
     local tmpcfg; tmpcfg=$(mktemp)
     jq '.inbounds = []' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
     printf '{}' >"$META"
@@ -1108,6 +1101,7 @@ delete_node() {
   if ! [[ "$IDX" =~ ^[0-9]+$ ]]; then warn "无效输入"; return; fi
   local idx0=$((IDX-1))
   if (( idx0 < 0 || idx0 >= (COUNT + ext_count) )); then warn "序号越界"; return; fi
+
   if (( idx0 >= COUNT )); then
     local ext_index=$((idx0 - COUNT))
     local tag_to_delete; tag_to_delete=$(jq -r --argjson i "$ext_index" 'to_entries | map(select(.value.type=="hysteria2")) | .[$i].key // empty' "$META")
@@ -1117,6 +1111,7 @@ delete_node() {
       # 删除对应元数据
       local tmpmeta; tmpmeta=$(mktemp)
       jq "del(.\"$tag_to_delete\")" "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
+
       # 停止并移除对应服务
       if [[ -f "/etc/systemd/system/hysteria2-${port_del}.service" ]]; then
         systemctl disable --now "hysteria2-${port_del}" >/dev/null 2>&1 || true
@@ -1162,14 +1157,15 @@ show_version_info() {
   else
     OS_NAME="${OS^}"
   fi
-  if command -v sing-box >/dev/null 2>&1; then
-    local VER ENV
-    VER=$(sing-box version 2>/dev/null | awk '/sing-box version/{print $3}')
-    ENV=$(sing-box version 2>/dev/null | awk -F'Environment: ' '/Environment:/{print $2}')
+  SINGBOX_BIN=$(command -v sing-box || echo "/usr/local/bin/sing-box")
+  if [ -x "$SINGBOX_BIN" ]; then
+    VER=$($SINGBOX_BIN version 2>/dev/null | head -n1 | awk '{print $NF}')
+    ENV=$($SINGBOX_BIN version 2>/dev/null | awk -F'Environment: ' '/Environment:/{print $2}')
     say "Sing-box 版本: ${VER:-未知}  | 架构: ${ENV:-未知}  | 系统: ${OS_NAME}"
   else
     say "Sing-box 版本: 未知  | 架构: 未知  | 系统: ${OS_NAME}"
   fi
+
 }
 
 # ---------------------- 主菜单 ----------------------
@@ -1182,7 +1178,7 @@ main_menu() {
   say "3) 删除用户（通过序号）"
   say "4) 检查并更新 Sing-box 到最新版"
   say "5) 重启 Sing-box 服务"
-  say "6) 完全卸载 / 重装"
+  say "6) 完全卸载 / 初始化重装"
   say "0) 系统检测与修复"
   say "9) 退出"
   say "==============================================================="
@@ -1194,7 +1190,7 @@ main_menu() {
     4) update_singbox ;;
     5) restart_singbox ;;
     6) reinstall_menu ;;
-	0) diagnose_menu ;;
+    0) diagnose_menu ;;
     9) exit 0 ;;
     *) warn "无效输入" ;;
   esac
@@ -1204,6 +1200,5 @@ main_menu() {
 ensure_dirs
 install_dependencies
 install_singbox_if_needed || true
-ensure_autostart
-# 如需快捷方式，可自行创建，例如 ln -sf "$(realpath "$0")" /usr/local/bin/sk
+# 如需快捷方式，可自行创建，例如 ln -sf "$(realpath "$0")" /usr/local/bin/sk5
 while true; do main_menu; done
