@@ -1178,7 +1178,7 @@ show_version_info() {
 main_menu() {
   say ""
   show_version_info
-  say "============= Sing-box 节点管理工具（IPv4 + IPv6） ============="
+  say "============= 嘻嘻哈哈 节点管理工具（IPv4 + IPv6） ============="
   say "1) 添加节点"
   say "2) 查看所有节点"
   say "3) 删除用户（通过序号）"
