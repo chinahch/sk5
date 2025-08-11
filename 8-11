@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-
-
 # sk5.sh — Sing-box 管理脚本（systemd/OpenRC 自适应）
 # 功能：依赖安装、sing-box 安装/自启动、添加/查看/删除节点、脚本服务（检测并修复/升级/重启/重装）、NAT模式
 # 修复：
@@ -9,7 +7,6 @@
 # - 移除错误的自调用包装函数，避免递归
 # - 当端口池用尽时明确提示；自动选择端口必定输出数字
 # - 菜单与提示语符合你的中文文案
-
 umask 022
 
 CONFIG="/etc/sing-box/config.json"
@@ -989,7 +986,7 @@ view_nodes() {
       local PORT TAG AUTH OBFS SNI
       TAG="$key"
       PORT=$(jq -r --arg t "$TAG" '.[$t].port // empty' "$META")
-      say "[$idx] 端口: $PORT | 协议: hysteria2 | 名称: $TAG"
+      say "[$idx] 端口: $PORT | 协议: hysteria2 | 名称: $TAG"	  
       AUTH=$(jq -r --arg t "$TAG" '.[$t].auth // empty' "$META")
       OBFS=$(jq -r --arg t "$TAG" '.[$t].obfs // empty' "$META")
       SNI=$(jq -r --arg t "$TAG" '.[$t].sni // empty' "$META")
@@ -1011,10 +1008,10 @@ delete_node() {
   if [[ ( -z "$COUNT" || "$COUNT" == "0" ) && ( -z "$ext_count" || "$ext_count" == "0" ) ]]; then say "暂无节点"; return; fi
   view_nodes
   say "[0] 返回主菜单"
-  say "[all] 删除所有节点"
-  read -rp "请输入要删除的节点序号 / all / 0: " IDX
+  say "[ss] 删除所有节点"
+  read -rp "请输入要删除的节点序号： " IDX
   [[ "$IDX" == "0" || -z "$IDX" ]] && return
-  if [[ "$IDX" == "all" ]]; then
+  if [[ "$IDX" == "ss" ]]; then
     read -rp " 确认删除全部节点？(y/N): " c; [[ "$c" == "y" ]] || { say "已取消"; return; }
     local tmpcfg; tmpcfg=$(mktemp)
     jq '.inbounds = []' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
@@ -1060,10 +1057,56 @@ delete_node() {
   fi
   ok "已删除节点 [$IDX]"
 }
+is_docker() {
+  # 检查 /.dockerenv 文件（Docker 容器默认会有）
+  if [ -f /.dockerenv ]; then
+    return 0
+  fi
+
+  # 检查 cgroup 信息（Docker 容器的 cgroup 通常包含 docker）
+  if grep -qE "/docker/|/lxc/" /proc/1/cgroup 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
+}
+
+# 获取系统信息
+OS_NAME=$(lsb_release -si 2>/dev/null || grep '^ID=' /etc/os-release | cut -d= -f2)
+OS_VER=$(lsb_release -sr 2>/dev/null || grep '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+
+# 检测 docker 并显示
+if is_docker; then
+  SYSTEM_INFO="$OS_NAME（docker）"
+else
+  SYSTEM_INFO="$OS_NAME"
+fi
+
+echo "系统: $SYSTEM_INFO"
+
 
 show_version_info() {
-  local OS OS_NAME
-  OS=$(detect_os); if [[ "$OS" == "unknown" ]]; then OS_NAME="未知"; else OS_NAME="${OS^}"; fi
+  local OS OS_NAME VIRT
+  OS=$(detect_os)
+  if [[ "$OS" == "unknown" ]]; then
+    OS_NAME="未知"
+  else
+    OS_NAME="${OS^}"
+  fi
+
+  # 检测虚拟化类型
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    VIRT=$(systemd-detect-virt)
+    if [[ "$VIRT" != "none" && -n "$VIRT" ]]; then
+      OS_NAME="${OS_NAME}（${VIRT}）"
+    fi
+  else
+    # Docker/LXC 兜底检测
+    if [[ -f /.dockerenv ]] || grep -qE "/docker/|/lxc/" /proc/1/cgroup 2>/dev/null; then
+      OS_NAME="${OS_NAME}（docker）"
+    fi
+  fi
+
   SINGBOX_BIN=$(command -v sing-box || echo "/usr/local/bin/sing-box")
   if [[ -x "$SINGBOX_BIN" ]]; then
     VER=$($SINGBOX_BIN version 2>/dev/null | head -n1 | awk '{print $NF}')
@@ -1073,6 +1116,7 @@ show_version_info() {
     say "Sing-box 版本: 未知  | 架构: 未知  | 系统: ${OS_NAME}"
   fi
 }
+
 
 # ============= 脚本服务菜单 =============
 script_services_menu() {
