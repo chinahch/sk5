@@ -482,7 +482,7 @@ update_singbox() {
 }
 
 reinstall_menu() {
-  echo "====== 修复 / 重装 Sing-box ======"
+  echo "====== 卸载 / 重装 Sing-box ======"
   echo "1) 完全卸载（清空所有服务）"
   echo "2) 保留节点配置并重装 Sing-box"
   echo "0) 返回"
