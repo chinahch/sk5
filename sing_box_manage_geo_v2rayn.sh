@@ -434,7 +434,8 @@ diagnose_menu() {
     echo "0) 返回主菜单"
     read -rp "请选择: " opt
     case "$opt" in
-        1)
+            4) disable_nat_mode ;;
+1)
             system_check
             ;;
         2)
@@ -659,7 +660,29 @@ add_node() {
 
     local PORT
     while true; do
-      read -rp "请输入端口号（留空自动随机 30000-39999；输入 0 返回）: " PORT
+  local prompt_text
+  if [[ -f /etc/sing-box/nat_ports.json ]]; then
+    prompt_text="请输入端口号（留空自动随机 NAT 范围；输入 0 返回）: "
+  else
+    prompt_text="请输入端口号（留空自动随机 30000-39999；输入 0 返回）: "
+  fi
+  read -rp "$prompt_text" PORT
+  if [[ -z "$PORT" ]]; then
+    if [[ -f /etc/sing-box/nat_ports.json ]]; then
+      PORT=$(get_random_nat_port)
+    else
+      PORT=$((RANDOM % 1000 + 30000))
+    fi
+    say "（已自动选择随机端口：$PORT）"
+  fi
+  [[ "$PORT" == "0" ]] && return
+  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then
+    warn "端口无效"; continue
+  fi
+  if ! check_nat_port "$PORT"; then
+    warn "端口 $PORT 不在 NAT 模式允许的范围内，请重新输入"
+    continue
+  fi
       if [[ -z "$PORT" ]]; then 
         PORT=$((RANDOM % 1000 + 30000))
         say "（已自动选择随机端口：$PORT）"
@@ -668,6 +691,7 @@ add_node() {
       if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then
         warn "端口无效"; continue
       fi
+      if ! check_nat_port "$PORT"; then warn "端口 $PORT 不在 NAT 模式允许的范围内，请重新输入"; continue; fi
       if jq -e --argjson p "$PORT" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
         warn "端口 $PORT 已存在，请换一个。"
         continue
@@ -753,14 +777,36 @@ add_node() {
     say "TAG: $TAG"
     say ""
     say " 客户端链接："
-    say "vless://${UUID}@${IPV4}:${PORT}encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
+    say "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
     say ""
     return
   else
     # SOCKS5
     local PORT USER PASS TAG tmpcfg
     while true; do
-      read -rp "请输入端口号（留空自动随机 40000-49999；输入 0 返回）: " PORT
+  local prompt_text
+  if [[ -f /etc/sing-box/nat_ports.json ]]; then
+    prompt_text="请输入端口号（留空自动随机 NAT 范围；输入 0 返回）: "
+  else
+    prompt_text="请输入端口号（留空自动随机 40000-49999；输入 0 返回）: "
+  fi
+  read -rp "$prompt_text" PORT
+  if [[ -z "$PORT" ]]; then
+    if [[ -f /etc/sing-box/nat_ports.json ]]; then
+      PORT=$(get_random_nat_port)
+    else
+      PORT=$((RANDOM % 10000 + 40000))
+    fi
+    say "（已自动选择随机端口：$PORT）"
+  fi
+  [[ "$PORT" == "0" ]] && return
+  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then
+    warn "端口无效"; continue
+  fi
+  if ! check_nat_port "$PORT"; then
+    warn "端口 $PORT 不在 NAT 模式允许的范围内，请重新输入"
+    continue
+  fi
       if [[ -z "$PORT" ]]; then 
         PORT=$((RANDOM % 10000 + 40000))
         say "（已自动选择随机端口：$PORT）"
@@ -769,6 +815,7 @@ add_node() {
       if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then 
         warn "端口无效"; continue
       fi
+      if ! check_nat_port "$PORT"; then warn "端口 $PORT 不在 NAT 模式允许的范围内，请重新输入"; continue; fi
       if jq -e --argjson p "$PORT" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
         warn "端口 $PORT 已存在，请换一个。"; continue
       fi
@@ -818,7 +865,29 @@ add_node() {
 add_hysteria2_node() {
   local PORT
   while true; do
-    read -rp "请输入端口号（留空自动随机 50000-59999；输入 0 返回）: " PORT
+  local prompt_text
+  if [[ -f /etc/sing-box/nat_ports.json ]]; then
+    prompt_text="请输入端口号（留空自动随机 NAT 范围；输入 0 返回）: "
+  else
+    prompt_text="请输入端口号（留空自动随机 50000-59999；输入 0 返回）: "
+  fi
+  read -rp "$prompt_text" PORT
+  if [[ -z "$PORT" ]]; then
+    if [[ -f /etc/sing-box/nat_ports.json ]]; then
+      PORT=$(get_random_nat_port)
+    else
+      PORT=$((RANDOM % 10000 + 50000))
+    fi
+    say "（已自动选择随机端口：$PORT）"
+  fi
+  [[ "$PORT" == "0" ]] && return
+  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then
+    warn "端口无效"; continue
+  fi
+  if ! check_nat_port "$PORT"; then
+    warn "端口 $PORT 不在 NAT 模式允许的范围内，请重新输入"
+    continue
+  fi
     if [[ -z "$PORT" ]]; then
       PORT=$((RANDOM % 10000 + 50000))
       say "（已自动选择随机端口：$PORT）"
@@ -827,6 +896,7 @@ add_hysteria2_node() {
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT<1 || PORT>65535)); then
       warn "端口无效"; continue
     fi
+      if ! check_nat_port "$PORT"; then warn "端口 $PORT 不在 NAT 模式允许的范围内，请重新输入"; continue; fi
     if jq -e --argjson p "$PORT" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
       warn "端口 $PORT 已存在，请换一个。"
       continue
@@ -955,10 +1025,10 @@ systemctl restart hysteria2-${PORT}.service >/dev/null 2>&1 || true
   say ""
   say " 客户端链接："
   if [[ -n "$IPV4" ]]; then
-    say "hysteria2://${AUTH_PWD}@${IPV4}:${PORT}obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
+    say "hysteria2://${AUTH_PWD}@${IPV4}:${PORT}?obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
   fi
   if [[ -n "$IPV6" ]]; then
-    say "hysteria2://${AUTH_PWD}@[${IPV6}]:${PORT}obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
+    say "hysteria2://${AUTH_PWD}@[${IPV6}]:${PORT}?obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
   fi
   say ""
 }
@@ -1018,7 +1088,7 @@ view_nodes() {
       [[ -z "$SID" || "$SID" == "null" ]] && SID=$(jq -r '.tls.reality.short_id[0] // empty' <<<"$json")
       # 生成客户端链接
       if [[ -n "$PBK" && -n "$SID" && -n "$SERVER_NAME" ]]; then
-        say "vless://${UUID}@${IPV4}:${PORT}encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${PBK}&sid=${SID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
+        say "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${PBK}&sid=${SID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
       else
         warn "节点参数不完整，无法生成链接"
       fi
@@ -1057,8 +1127,8 @@ view_nodes() {
       OBFS=$(jq -r --arg t "$TAG" '.[$t].obfs // empty' "$META")
       SNI=$(jq -r --arg t "$TAG" '.[$t].sni // empty' "$META")
       if [[ -n "$AUTH" && -n "$OBFS" && -n "$SNI" ]]; then
-        say "hysteria2://${AUTH}@${IPV4}:${PORT}obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
-        [[ -n "$IPV6" ]] && say "hysteria2://${AUTH}@[${IPV6}]:${PORT}obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
+        say "hysteria2://${AUTH}@${IPV4}:${PORT}?obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
+        [[ -n "$IPV6" ]] && say "hysteria2://${AUTH}@[${IPV6}]:${PORT}?obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
       else
         warn "节点参数不完整，无法生成链接"
       fi
@@ -1168,6 +1238,105 @@ show_version_info() {
 
 }
 
+# ---------------------- NAT 模式功能 ----------------------
+nat_mode_menu() {
+  say "====== NAT模式设置 ======"
+  say "1) 设置范围端口"
+  say "2) 设置自定义端口"
+  say "3) 查看当前NAT端口规则"
+  say "4) 退出NAT模式"
+  say "0) 返回主菜单"
+  read -rp "请选择: " opt
+  case "$opt" in
+        4) disable_nat_mode ;;
+1) set_nat_range ;;
+    2) set_nat_custom ;;
+    3) view_nat_ports ;;
+    0) return ;;
+    *) warn "无效输入" ;;
+  esac
+}
+
+set_nat_range() {
+  read -rp "请输入范围端口（可多个，用空格分隔，如 12000-12020 34050-34070）: " ranges
+  jq -n --argjson arr "$(printf '%s\n' "$ranges" | jq -R 'split(" ")')"      '{"mode":"range","ranges":$arr,"custom":[]}' > /etc/sing-box/nat_ports.json
+  ok "范围端口已保存"
+}
+
+set_nat_custom() {
+  read -rp "请输入自定义端口（可多个，用空格分隔，如 12345 34567）: " ports
+  jq -n --argjson arr "$(printf '%s\n' "$ports" | jq -R 'split(" ") | map(tonumber)')"      '{"mode":"custom","ranges":[],"custom":$arr}' > /etc/sing-box/nat_ports.json
+  ok "自定义端口已保存"
+}
+
+view_nat_ports() {
+
+disable_nat_mode() {
+  local nat_file="/etc/sing-box/nat_ports.json"
+  if [[ -f "$nat_file" ]]; then
+    rm -f "$nat_file"
+    ok "NAT模式已关闭（规则已清除）"
+  else
+    warn "当前未启用 NAT 模式"
+  fi
+}
+
+  local nat_file="/etc/sing-box/nat_ports.json"
+  if [[ ! -f "$nat_file" ]]; then
+    warn "当前未设置 NAT 模式规则"
+    return
+  fi
+  say "当前 NAT 模式配置："
+  cat "$nat_file"
+}
+
+check_nat_port() {
+  local port="$1"
+  local nat_file="/etc/sing-box/nat_ports.json"
+  [[ ! -f "$nat_file" ]] && return 0
+  local mode
+  mode=$(jq -r '.mode' "$nat_file")
+  if [[ "$mode" == "range" ]]; then
+    while read -r range; do
+      local start=${range%-*}
+      local end=${range#*-}
+      if (( port >= start && port <= end )); then
+        return 0
+      fi
+    done < <(jq -r '.ranges[]' "$nat_file")
+    return 1
+  elif [[ "$mode" == "custom" ]]; then
+    jq -r '.custom[]' "$nat_file" | grep -qx "$port" && return 0
+    return 1
+  fi
+  return 0
+}
+
+
+get_random_nat_port() {
+  local nat_file="/etc/sing-box/nat_ports.json"
+  if [[ -f "$nat_file" ]]; then
+    local mode
+    mode=$(jq -r '.mode' "$nat_file")
+    if [[ "$mode" == "range" ]]; then
+      local ports=()
+      while read -r range; do
+        local start=${range%-*}
+        local end=${range#*-}
+        for ((p=start; p<=end; p++)); do
+          ports+=("$p")
+        done
+      done < <(jq -r '.ranges[]' "$nat_file")
+      [[ ${#ports[@]} -gt 0 ]] && echo "${ports[RANDOM % ${#ports[@]}]}" && return
+    elif [[ "$mode" == "custom" ]]; then
+      mapfile -t ports < <(jq -r '.custom[]' "$nat_file")
+      [[ ${#ports[@]} -gt 0 ]] && echo "${ports[RANDOM % ${#ports[@]}]}" && return
+    fi
+  fi
+  # 默认随机
+  echo $((RANDOM % 1000 + 30000))
+}
+
 # ---------------------- 主菜单 ----------------------
 main_menu() {
   say ""
@@ -1180,10 +1349,12 @@ main_menu() {
   say "5) 重启 Sing-box 服务"
   say "6) 完全卸载 / 初始化重装"
   say "0) 系统检测与修复"
+  say "7) NAT模式设置"
   say "9) 退出"
   say "==============================================================="
   read -rp "请输入操作编号: " CHOICE
   case "$CHOICE" in
+    7) nat_mode_menu ;;
     1) add_node ;;
     2) view_nodes ;;
     3) delete_node ;;
