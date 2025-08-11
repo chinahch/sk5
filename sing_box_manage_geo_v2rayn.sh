@@ -488,10 +488,12 @@ reinstall_menu() {
   echo "0) 返回"
   read -rp "请选择: " choice
   case "$choice" in
-    1)
-      echo " 即将卸载 Sing-box、Hysteria2 及相关文件..."
+        1)
+      echo " 即将卸载 Sing-box、Hysteria2 及相关文件（包含本脚本）..."
       read -rp "确认继续 (y/N): " confirm
       [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+
+      # 停止服务并清理
       systemctl stop sing-box 2>/dev/null
       systemctl disable sing-box 2>/dev/null
       shopt -s nullglob
@@ -512,8 +514,17 @@ reinstall_menu() {
       rm -f "$META"
       apt-get clean
       systemctl daemon-reload
+
       say " Sing-box、Hysteria2 已完全卸载"
+
+      # 删除当前脚本文件
+      SCRIPT_PATH="$(realpath "$0")"
+      rm -f "$SCRIPT_PATH"
+
+      echo "脚本已删除，程序退出。"
+      exit 0
       ;;
+
     2)
       systemctl stop sing-box 2>/dev/null
       echo " 正在重新安装 Sing-box（保留节点配置）..."
