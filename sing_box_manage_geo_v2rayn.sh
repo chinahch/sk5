@@ -50,11 +50,16 @@ install_dependencies() {
   if ((${#need[@]})); then
     case "$(detect_os)" in
       debian|ubuntu)
+        printf "\n[等待] 正在更新软件源，请稍候...\n"
         DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+        printf "[等待] 正在安装运行所需依赖，请稍候...\n"
         DEBIAN_FRONTEND=noninteractive apt-get install -y "${need[@]}" >/dev/null 2>&1 || true ;;
-      alpine) apk add --no-cache "${need[@]}" >/dev/null 2>&1 || true ;;
-      centos|rhel) yum install -y "${need[@]}" >/dev/null 2>&1 || true ;;
-      fedora) dnf install -y "${need[@]}" >/dev/null 2>&1 || true ;;
+      alpine) printf "[等待] 正在安装运行所需依赖（Alpine）...\n"
+        apk add --no-cache "${need[@]}" >/dev/null 2>&1 || true ;;
+      centos|rhel) printf "[等待] 正在安装运行所需依赖（CentOS/RHEL）...\n"
+        yum install -y "${need[@]}" >/dev/null 2>&1 || true ;;
+      fedora) printf "[等待] 正在安装运行所需依赖（Fedora）...\n"
+        dnf install -y "${need[@]}" >/dev/null 2>&1 || true ;;
       *) warn "未识别系统，请确保安装：${need[*]}" ;;
     esac
   fi
