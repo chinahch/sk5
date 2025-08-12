@@ -65,6 +65,38 @@ install_dependencies() {
   fi
   ok "依赖已满足（curl/jq/uuidgen/openssl/iproute2/lsof）"
 }
+# —— 新增：逐项确保指定命令可用（按不同发行版安装对应包）——
+ensure_cmd() {
+  # 用法：ensure_cmd <command> <debian_pkg> <alpine_pkg> <centos_pkg> <fedora_pkg>
+  local cmd="$1" deb="$2" alp="$3" cen="$4" fed="$5"
+  command -v "$cmd" >/dev/null 2>&1 && return 0
+  case "$(detect_os)" in
+    debian|ubuntu)
+      DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "$deb" >/dev/null 2>&1 || true ;;
+    alpine)
+      apk add --no-cache "$alp" >/dev/null 2>&1 || true ;;
+    centos|rhel)
+      yum install -y "$cen" >/dev/null 2>&1 || true ;;
+    fedora)
+      dnf install -y "$fed" >/dev/null 2>&1 || true ;;
+    *) warn "未识别系统，请手动安装：$cmd" ;;
+  esac
+  command -v "$cmd" >/dev/null 2>&1
+}
+
+# —— 新增：在需要用到前“兜底安装”关键依赖（多次调用无副作用）——
+ensure_runtime_deps() {
+  # curl / jq / uuidgen / openssl / ss / lsof
+  ensure_cmd curl     curl        curl        curl        curl
+  ensure_cmd jq       jq          jq          jq          jq
+  # uuidgen 在 Debian/Ubuntu 提供于 uuid-runtime；在 Alpine 是 util-linux
+  ensure_cmd uuidgen  uuid-runtime util-linux util-linux  util-linux
+  ensure_cmd openssl  openssl      openssl     openssl     openssl
+  # ss 在 Debian/Ubuntu 来自 iproute2；Alpine 也叫 iproute2
+  ensure_cmd ss       iproute2     iproute2    iproute    iproute
+  ensure_cmd lsof     lsof         lsof        lsof        lsof
+}
 
 install_singbox_if_needed() {
   if command -v sing-box >/dev/null 2>&1; then return 0; fi
@@ -274,6 +306,30 @@ EOF
   echo "已安装并启用 systemd 自启动服务：sing-box"
 }
 
+install_autostart_fallback() {
+  # cron @reboot 兜底（幂等）
+  if command -v crontab >/dev/null 2>&1; then
+    ( crontab -l 2>/dev/null | grep -v 'sing-box run -c /etc/sing-box/config.json' ; \
+      echo '@reboot /usr/local/bin/sing-box run -c /etc/sing-box/config.json >> /var/log/sing-box.log 2>&1 &' ) | crontab -
+    echo "已添加 @reboot cron 兜底自启"
+  fi
+
+  # /etc/rc.local 兜底（幂等）
+  if [[ ! -f /etc/rc.local ]]; then
+    cat > /etc/rc.local <<'RC'
+#!/bin/sh -e
+/usr/local/bin/sing-box run -c /etc/sing-box/config.json >> /var/log/sing-box.log 2>&1 &
+exit 0
+RC
+    chmod +x /etc/rc.local
+    echo "已创建 /etc/rc.local 兜底自启"
+  else
+    grep -q 'sing-box run -c /etc/sing-box/config.json' /etc/rc.local || \
+      sed -i '1a /usr/local/bin/sing-box run -c /etc/sing-box/config.json >> /var/log/sing-box.log 2>&1 &' /etc/rc.local
+    chmod +x /etc/rc.local
+    echo "已更新 /etc/rc.local 兜底自启"
+  fi
+}
 
 # ============= NAT 规则存取/校验 =============
 # ============= NAT 规则存取/校验（清爽展示 + 左右分栏菜单） =============
@@ -722,6 +778,8 @@ check_and_repair_menu() {
 
 # ============= 节点操作（含 NAT 端口约束） =============
 add_node() {
+# 进入添加节点前，再次兜底确保依赖完整
+ensure_runtime_deps
   while true; do
     say "请选择协议类型："
     say "0) 返回主菜单"
@@ -892,6 +950,7 @@ add_node() {
 
 add_hysteria2_node() {
   local PORT proto="udp" mode
+  ensure_runtime_deps
   while true; do
     if [[ -f "$NAT_FILE" ]]; then
       mode=$(jq -r '.mode' "$NAT_FILE")
