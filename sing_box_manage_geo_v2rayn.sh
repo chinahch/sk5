@@ -246,7 +246,9 @@ restart_singbox() {
 }
 
 install_systemd_service() {
-  local SERVICE_FILE="/lib/systemd/system/sing-box.service"
+  local SERVICE_FILE="/etc/systemd/system/sing-box.service"
+  mkdir -p /etc/systemd/system
+
   cat > "$SERVICE_FILE" <<'EOF'
 [Unit]
 Description=Sing-box Service
@@ -254,18 +256,24 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Type=simple
+ExecStartPre=/usr/local/bin/sing-box check -c /etc/sing-box/config.json
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-Restart=always
-RestartSec=5
+Restart=on-failure
+RestartSec=3s
 LimitNOFILE=1048576
 User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+  # 关键：加载并开机自启 + 立即启动
   systemctl daemon-reload
-  echo "已安装/刷新 systemd 自启动服务：sing-box"
+  systemctl enable --now sing-box >/dev/null 2>&1 || true
+  echo "已安装并启用 systemd 自启动服务：sing-box"
 }
+
 
 # ============= NAT 规则存取/校验 =============
 # ============= NAT 规则存取/校验（清爽展示 + 左右分栏菜单） =============
@@ -282,20 +290,21 @@ view_nat_ports() {
     C_CYAN=$'\033[36m'; C_GRN=$'\033[32m'; C_YLW=$'\033[33m'
   fi
 
-  # 网格打印：_print_grid <每行列数> <单元宽度> <items...>
+  # 网格打印（用 * 指定宽度，避免把变量拼进格式串）
   _print_grid() {
     local cols="$1" cellw="$2"; shift 2
     local i=0 item
     for item in "$@"; do
-      printf "%-${cellw}s" "$item"
+      printf "%-*s" "$cellw" "$item"
       i=$((i+1))
-      if (( i % cols == 0 )); then echo; else printf " "; fi
+      if (( i % cols == 0 )); then printf "\n"; else printf " "; fi
     done
-    (( i % cols != 0 )) && echo
+    (( i % cols != 0 )) && printf "\n"
   }
 
   local mode; mode=$(jq -r '.mode // "custom"' "$NAT_FILE")
-  printf "%s当前 NAT 模式:%s %s\n\n" "$BOLD" "$C_END" "$mode"
+  # 分拆打印，彻底规避选项误判
+  printf "%s" "$BOLD"; printf "%s" "当前 NAT 模式:"; printf "%s" "$C_END"; printf " %s\n\n" "$mode"
 
   # 读取数据
   local -a ranges tcp udp
@@ -303,36 +312,33 @@ view_nat_ports() {
   mapfile -t tcp    < <(jq -r '.custom_tcp[]?' "$NAT_FILE")
   mapfile -t udp    < <(jq -r '.custom_udp[]?' "$NAT_FILE")
 
-  # 范围端口（仅在有值时显示）
+  # 范围端口
   if ((${#ranges[@]})); then
-    printf "%s范围端口:%s\n"  "${BOLD}${C_CYAN}" "${C_END}"
-    _print_grid 4 13 "${ranges[@]}"   # 适配 12000-12020 这种宽度
-    echo
+    printf "%s%s范围端口:%s\n" "$BOLD" "$C_CYAN" "$C_END"
+    _print_grid 4 13 "${ranges[@]}"
+    printf "\n"
   fi
 
-  # 自定义 TCP（仅展示排序去重后的列表，不改文件）
+  # 自定义 TCP
   if ((${#tcp[@]})); then
     mapfile -t tcp < <(printf '%s\n' "${tcp[@]}" | grep -E '^[0-9]+$' | sort -n -u)
-    printf "%s自定义 TCP 端口:%s\n" "${BOLD}${C_GRN}" "${C_END}"
-    _print_grid 8 6 "${tcp[@]}"
-    echo
+    printf "%s%s自定义 TCP 端口:%s\n" "$BOLD" "$C_GRN" "$C_END"
+    _print_grid 8 6 "${tcp[@]}"; printf "\n"
   fi
 
   # 自定义 UDP
   if ((${#udp[@]})); then
     mapfile -t udp < <(printf '%s\n' "${udp[@]}" | grep -E '^[0-9]+$' | sort -n -u)
-    printf "%s自定义 UDP 端口:%s\n" "${BOLD}${C_YLW}" "${C_END}"
-    _print_grid 8 6 "${udp[@]}"
-    echo
+    printf "%s%s自定义 UDP 端口:%s\n" "$BOLD" "$C_YLW" "$C_END"
+    _print_grid 8 6 "${udp[@]}"; printf "\n"
   fi
 
-  # —— 左右分栏菜单（对齐版）——
+  # 菜单（同样用 * 指定宽度）
   local w_left=34
   printf "------ 端口规则管理 ------\n"
-  printf "%-${w_left}s %s\n" \
-    "1) 添加范围端口（例如 12000-12020）" "2) 删除范围端口" \
-    "3) 添加自定义TCP端口"                 "4) 删除自定义TCP端口" \
-    "5) 添加自定义UDP端口"                 "6) 删除自定义UDP端口"
+  printf "%-*s %s\n" "$w_left" "1) 添加范围端口（例如 12000-12020）" "2) 删除范围端口"
+  printf "%-*s %s\n" "$w_left" "3) 添加自定义TCP端口"                 "4) 删除自定义TCP端口"
+  printf "%-*s %s\n" "$w_left" "5) 添加自定义UDP端口"                 "6) 删除自定义UDP端口"
   printf "%s\n" "0) 返回"
   printf "%s\n\n" "提示： 空格分隔"
 
@@ -340,13 +346,10 @@ view_nat_ports() {
   case "$op" in
     1)
       read -rp "输入范围段: " ranges_in
-      if [[ -z "$ranges_in" ]]; then warn "未输入"; return; fi
+      [[ -z "$ranges_in" ]] && { warn "未输入"; return; }
       local tmp; tmp=$(mktemp)
       jq --argjson arr "$(printf '%s\n' "$ranges_in" | jq -R 'split(" ")')" \
-         '.mode="range"
-          | .ranges = ((.ranges // []) + $arr)
-          | .custom_tcp = (.custom_tcp // [])
-          | .custom_udp = (.custom_udp // [])' \
+         '.mode="range"|.ranges=((.ranges//[])+$arr)|.custom_tcp=(.custom_tcp//[])|.custom_udp=(.custom_udp//[])' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
       ok "已添加范围段"
       ;;
@@ -354,46 +357,38 @@ view_nat_ports() {
       read -rp "输入要删除的范围段（完全匹配）: " seg
       [[ -z "$seg" ]] && { warn "未输入"; return; }
       local tmp; tmp=$(mktemp)
-      jq --arg seg "$seg" \
-         '.ranges = ((.ranges // []) | map(select(. != $seg)))' \
-         "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
+      jq --arg seg "$seg" '.ranges=((.ranges//[])|map(select(.!=$seg)))' "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
       ok "已删除范围段"
       ;;
     3)
       read -rp "输入要添加的TCP端口（空格分隔）: " ports
       local tmp; tmp=$(mktemp)
-      jq --argjson add "$(printf '%s\n' "$ports" | jq -R 'split(" ")|map(tonumber)')" \
-         '.mode="custom"
-          | .custom_tcp = ((.custom_tcp // []) + $add)
-          | .custom_udp = (.custom_udp // [])
-          | .ranges=[]' \
+      jq --argjson add "$(printf '%s\n' "$ports" | jq -R 'split(\" \")|map(tonumber)')" \
+         '.mode="custom"|.custom_tcp=((.custom_tcp//[])+$add)|.custom_udp=(.custom_udp//[])|.ranges=[]' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
       ok "已添加TCP端口"
       ;;
     4)
       read -rp "输入要删除的TCP端口（空格分隔）: " ports
       local tmp; tmp=$(mktemp)
-      jq --argjson del "$(printf '%s\n' "$ports" | jq -R 'split(" ")|map(tonumber)')" \
-         '.custom_tcp = ((.custom_tcp // []) | map(select( ( $del | index(.) ) | not )))' \
+      jq --argjson del "$(printf '%s\n' "$ports" | jq -R 'split(\" \")|map(tonumber)')" \
+         '.custom_tcp=((.custom_tcp//[])|map(select(( $del|index(.) )|not )))' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
       ok "已删除TCP端口"
       ;;
     5)
       read -rp "输入要添加的UDP端口（空格分隔）: " ports
       local tmp; tmp=$(mktemp)
-      jq --argjson add "$(printf '%s\n' "$ports" | jq -R 'split(" ")|map(tonumber)')" \
-         '.mode="custom"
-          | .custom_udp = ((.custom_udp // []) + $add)
-          | .custom_tcp = (.custom_tcp // [])
-          | .ranges=[]' \
+      jq --argjson add "$(printf '%s\n' "$ports" | jq -R 'split(\" \")|map(tonumber)')" \
+         '.mode="custom"|.custom_udp=((.custom_udp//[])+$add)|.custom_tcp=(.custom_tcp//[])|.ranges=[]' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
       ok "已添加UDP端口"
       ;;
     6)
       read -rp "输入要删除的UDP端口（空格分隔）: " ports
       local tmp; tmp=$(mktemp)
-      jq --argjson del "$(printf '%s\n' "$ports" | jq -R 'split(" ")|map(tonumber)')" \
-         '.custom_udp = ((.custom_udp // []) | map(select( ( $del | index(.) ) | not )))' \
+      jq --argjson del "$(printf '%s\n' "$ports" | jq -R 'split(\" \")|map(tonumber)')" \
+         '.custom_udp=((.custom_udp//[])|map(select(( $del|index(.) )|not )))' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
       ok "已删除UDP端口"
       ;;
@@ -1273,5 +1268,19 @@ main_menu() {
 ensure_dirs
 install_dependencies
 install_singbox_if_needed || true
-install_systemd_service
+
+INIT_SYS=$(detect_init_system)
+case "$INIT_SYS" in
+  systemd)
+    install_systemd_service        # 写入并 enable --now
+    ;;
+  openrc)
+    ensure_service_openrc          # 写入 OpenRC 脚本并 rc-update
+    ;;
+  *)
+    echo "未检测到 systemd/openrc，启用兜底自启动..."
+    install_autostart_fallback     # cron/rc.local 双兜底
+    ;;
+esac
+
 while true; do main_menu; done
