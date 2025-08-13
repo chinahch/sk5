@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # === Ctrl+C 安全处理 & 守护启动工具 ===
-on_int() { echo -e "\n(提示) 捕获到 Ctrl+C：仅退出菜单，后台 sing-box/守护不受影响。"; exit 0; }
-trap on_int INT
-
+# === Ctrl+C 安全处理（只退菜单，不清理/不杀服务） ===
+_INT_MSG_SHOWN=0
+on_int_menu_quit_only() {
+  if [[ ${_INT_MSG_SHOWN} -eq 0 ]]; then
+    echo -e "
+(提示) 捕获到 Ctrl+C：仅退出菜单，后台 sing-box/守护不受影响。"
+  fi
+  _INT_MSG_SHOWN=1
+  trap - EXIT        # 关键：清空 EXIT trap，避免触发清理逻辑误杀服务
+  exit 0
+}
+trap on_int_menu_quit_only INT
+trap '' SIGHUP 2>/dev/null || true  # 断开终端也不触发退出清理
 daemonize() { setsid "$@" </dev/null >/dev/null 2>&1 & }
 # ===== 233boy install.sh 全静默执行（一次性） =====
 sb233_run_install_silent() {
@@ -10,6 +20,33 @@ sb233_run_install_silent() {
 # --- Sing-box 版本/架构探测（兼容 233 的 /etc/sing-box/bin） ---
 # 让 233 的二进制优先被找到（不改变系统 PATH 的持久配置，仅对本进程生效）
 export PATH="/etc/sing-box/bin:$PATH"
+
+# ====== [Override Block B] container-friendly autostart (systemctl → fallback) ======
+# 覆盖函数：install_systemd_service、restart_singbox
+# 策略：优先 systemd；失败时自动 fallback 到后台（sb-singleton + rc.local + cron 看门狗）
+
+# ---- 工具 ----
+_sb_bin() {
+  local b="${SING_BOX_BIN:-/usr/local/bin/sing-box}"
+  [[ -x "$b" ]] || b="/etc/sing-box/bin/sing-box"
+  [[ -x "$b" ]] || b="$(command -v sing-box 2>/dev/null || true)"
+  printf "%s" "$b"
+}
+_sb_cfg() { printf "%s" "${CONFIG:-/etc/sing-box/config.json}"; }
+
+# 任一入站端口开始监听即视为 OK
+_sb_any_port_listening() {
+  local cfg="$(_sb_cfg)"
+  [[ -s "$cfg" ]] || return 1
+  local any=""
+  while read -r p; do
+    [[ -z "$p" ]] && continue
+    if ss -ltnp 2>/dev/null | grep -q ":$p "; then any=1; break; fi
+    timeout 1 bash -lc "echo >/dev/tcp/127.0.0.1/$p" >/dev/null 2>&1 && { any=1; break; }
+  done < <(jq -r '.inbounds[].listen_port' "$cfg" 2>/dev/null)
+  [[ -n "$any" ]]
+}
+
 
 # 找到 sing-box 的有效路径：优先显式变量、其次 233 路径、然后 PATH，最后从运行进程反查
 resolve_singbox_bin() {
@@ -228,12 +265,29 @@ ensure_runtime_deps() {
 install_singbox_if_needed() {
   if command -v sing-box >/dev/null 2>&1; then return 0; fi
 
+  
   fix_ca_certificates() {
     if [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
       warn "检测到 CA 证书缺失，正在安装 ca-certificates..."
-      apt-get update -y
-      apt-get install --reinstall -y ca-certificates
-      update-ca-certificates
+      case "$(detect_os)" in
+        alpine)
+          apk add --no-cache ca-certificates >/dev/null 2>&1 || true
+          update-ca-certificates >/dev/null 2>&1 || true
+          ;;
+        centos|rhel)
+          yum -y install ca-certificates >/dev/null 2>&1 || true
+          update-ca-trust force-enable >/dev/null 2>&1 || true
+          ;;
+        fedora)
+          dnf -y install ca-certificates >/dev/null 2>&1 || true
+          update-ca-trust >/dev/null 2>&1 || true
+          ;;
+        debian|ubuntu|*)
+          apt-get update -y >/dev/null 2>&1 || true
+          apt-get install --reinstall -y ca-certificates >/dev/null 2>&1 || true
+          update-ca-certificates >/dev/null 2>&1 || true
+          ;;
+      esac
       ok "CA 证书已修复"
     fi
   }
@@ -356,68 +410,55 @@ kill_rogue_singbox() {
   done
 }
 
+# ---- helpers (early) ----
+type _sb_bin >/dev/null 2>&1 || _sb_bin() {
+  local b="${SING_BOX_BIN:-/usr/local/bin/sing-box}"
+  [[ -x "$b" ]] || b="/etc/sing-box/bin/sing-box"
+  [[ -x "$b" ]] || b="$(command -v sing-box 2>/dev/null || true)"
+  printf "%s" "$b"
+}
+type _sb_cfg >/dev/null 2>&1 || _sb_cfg() {
+  printf "%s" "${CONFIG:-/etc/sing-box/config.json}"
+}
+# ---- end helpers ----
 restart_singbox() {
-  local init; init=$(detect_init_system)
-  if [[ "$init" == "systemd" ]]; then
-    kill_rogue_singbox
+  local BIN; BIN="$(_sb_bin)"
+  local CFG; CFG="$(_sb_cfg)"
+
+  if command -v systemctl >/dev/null 2>&1; then
     timeout 8s systemctl stop sing-box >/dev/null 2>&1 || true
     systemctl kill -s SIGKILL sing-box >/dev/null 2>&1 || true
     sleep 0.4
+    if ! "$BIN" check -c "$CFG" >/dev/null 2>&1; then
+      err "配置文件校验失败：$CFG"; "$BIN" check -c "$CFG" || true; return 1
+    fi
     systemctl start sing-box --no-block >/dev/null 2>&1 || true
-
-    local okflag=0 i any_listen
-    for i in {1..60}; do
-      any_listen=$(jq -r '.inbounds[].listen_port' "$CONFIG" 2>/dev/null | while read -r p; do
-        [[ -z "$p" ]] && continue
-        if ss -ltnp 2>/dev/null | grep -q ":$p "; then echo ok; break; fi
-        if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/$p" >/dev/null 2>&1; then echo ok; break; fi
-      done)
-      if [[ "$any_listen" == "ok" ]]; then okflag=1; break; fi
-      if systemctl is-active --quiet sing-box; then okflag=1; break; fi
-      printf "."; sleep 0.5
+    local okflag=0
+    for i in $(seq 1 30); do
+      systemctl is-active --quiet sing-box && { okflag=1; break; }
+      _sb_any_port_listening && { okflag=1; break; }
+      sleep 0.5
     done
-    echo
-    if [[ $okflag -eq 1 ]]; then ok "Sing-box 重启完成"; else
-      err "Sing-box 重启失败"
-      journalctl -u sing-box --no-pager -n 120 2>/dev/null || true
-      return 1
-    fi
-  elif [[ "$init" == "openrc" ]]; then
-    timeout 8s rc-service sing-box stop >/dev/null 2>&1 || true
-    pids=$(pgrep -x sing-box) || true
-    if [[ -n "$pids" ]]; then for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done; fi
-    sleep 0.4
-    timeout 8s rc-service sing-box start >/dev/null 2>&1 || true
-    sleep 1
-    if rc-service sing-box status 2>/dev/null | grep -q started; then ok "Sing-box 重启完成（OpenRC）"
-    else err "Sing-box 重启失败（OpenRC）"; tail -n 120 /var/log/sing-box.log 2>/dev/null || true; return 1; fi
-  else
-    warn "未检测到受支持的服务管理器，将后台启动 Sing-box 进程"
-    pids=$(pgrep -x sing-box) || true
-    if [[ -n "$pids" ]]; then for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done; fi
-    if ! /usr/local/bin/sing-box check -c "$CONFIG" >/dev/null 2>&1; then
-      err "配置文件校验失败，无法重启"; sing-box check -c "$CONFIG"; return 1
-    fi
-    nohup /usr/local/bin/sing-box run -c "$CONFIG" >/var/log/sing-box.log 2>&1 &
-    local SING_PID=$! okflag=0 i any_listen
-    for i in {1..60}; do
-      any_listen=$(jq -r '.inbounds[].listen_port' "$CONFIG" 2>/dev/null | while read -r p; do
-        [[ -z "$p" ]] && continue
-        if ss -ltnp 2>/dev/null | grep -q ":$p "; then echo ok; break; fi
-        if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/$p" >/dev/null 2>&1; then echo ok; break; fi
-      done)
-      if [[ "$any_listen" == "ok" ]]; then okflag=1; break; fi
-      if kill -0 "$SING_PID" 2>/dev/null; then sleep 0.5; else break; fi
-    done
-    if [[ $okflag -eq 1 ]]; then ok "Sing-box 重启完成（进程已启动）"
-    else err "Sing-box 重启失败"; tail -n 120 /var/log/sing-box.log 2>/dev/null || true; return 1; fi
+    if (( okflag==1 )); then ok "Sing-box 重启完成（systemd）"; return 0; fi
+    warn "当前环境虽有 systemctl，但重启失败；切换 fallback 后台运行"
   fi
-}
 
+  pkill -9 -f "$BIN run -c $CFG" 2>/dev/null || true
+  pkill -9 -x sing-box 2>/dev/null || true
+  install_singleton_wrapper
+  install_autostart_fallback
+  start_singbox_singleton_force
+
+  for i in $(seq 1 30); do
+    _sb_any_port_listening && { ok "Sing-box 重启完成（fallback 后台）"; return 0; }
+    sleep 0.5
+  done
+  err "Sing-box 重启失败（fallback 也未监听），请查看 /var/log/sing-box.log"
+  return 1
+}
 install_systemd_service() {
   local SERVICE_FILE="/etc/systemd/system/sing-box.service"
   mkdir -p /etc/systemd/system
-
   cat > "$SERVICE_FILE" <<'EOF'
 [Unit]
 Description=Sing-box Service
@@ -437,10 +478,28 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-  # 关键：加载并开机自启 + 立即启动
-  systemctl daemon-reload
+  systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable --now sing-box >/dev/null 2>&1 || true
-  echo "已安装并启用 systemd 自启动服务：sing-box"
+
+  local okflag=0
+  for i in $(seq 1 20); do
+    systemctl is-active --quiet sing-box && { okflag=1; break; }
+    _sb_any_port_listening && { okflag=1; break; }
+    sleep 0.5
+  done
+  if (( okflag==1 )); then ok "已安装并启用 systemd 自启动服务：sing-box"; return 0; fi
+
+  warn "systemd 服务启动失败，切换为容器友好后台运行（fallback）"
+  install_singleton_wrapper
+  install_autostart_fallback
+  start_singbox_singleton_force
+
+  for i in $(seq 1 20); do
+    _sb_any_port_listening && { ok "fallback 已启动 sing-box（后台）"; return 0; }
+    sleep 0.5
+  done
+  err "fallback 启动失败，请检查 /var/log/sing-box.log"
+  return 1
 }
 
 choose_start_mode() {
@@ -534,9 +593,20 @@ WRAP
   chmod +x /usr/local/bin/sb-singleton
 }
 
-
 install_autostart_fallback() {
   # Ensure rc.local contains sb-singleton & and is executable
+
+  # 如果是 OpenRC（如 Alpine），也写入 /etc/local.d 并启用 local 服务
+  if command -v rc-update >/dev/null 2>&1 && [[ -d /etc/local.d ]]; then
+    mkdir -p /etc/local.d
+    cat > /etc/local.d/sb-singleton.start <<'EOLC'
+#!/bin/sh
+/usr/local/bin/sb-singleton >> /var/log/sing-box.log 2>&1 &
+exit 0
+EOLC
+    chmod +x /etc/local.d/sb-singleton.start
+    rc-update add local default >/dev/null 2>&1 || true
+  fi
   if [[ ! -f /etc/rc.local ]]; then
     cat > /etc/rc.local <<'RC'
 #!/bin/sh -e
@@ -740,7 +810,7 @@ set_nat_custom_udp() {
 
 # NAT 菜单（按你的格式）
 nat_mode_menu() {
-  say "====== NAT模式设置 ======"
+  say "====== NAT 模式设置 ======"
   say "1) 设置范围端口"
   say "2) 设置自定义TCP端口"
   say "3) 设置自定义UDP端口"
@@ -1575,7 +1645,7 @@ main_menu() {
   say "2) 查看所有节点"
   say "3) 删除节点"
   say "4) 脚本服务"
-  say "5) NAT模式设置"
+  say "5) NAT 模式设置"
   say "0) 退出"
   say "==============================================================="
   read -rp "请输入操作编号: " CHOICE
@@ -1621,6 +1691,7 @@ start_singbox_legacy_nohup
 ;;
 esac
 
+trap on_int_menu_quit_only INT
 while true; do main_menu; done
 
 # ====== [Override Block A] Ctrl+C 只退出菜单，不影响后台守护 ======
@@ -1641,32 +1712,6 @@ on_int_menu_quit_only() {
 trap on_int_menu_quit_only INT
 # 可选：防止挂起导致退出
 trap '' SIGHUP 2>/dev/null || true
-
-# ====== [Override Block B] container-friendly autostart (systemctl → fallback) ======
-# 覆盖函数：install_systemd_service、restart_singbox
-# 策略：优先 systemd；失败时自动 fallback 到后台（sb-singleton + rc.local + cron 看门狗）
-
-# ---- 工具 ----
-_sb_bin() {
-  local b="${SING_BOX_BIN:-/usr/local/bin/sing-box}"
-  [[ -x "$b" ]] || b="/etc/sing-box/bin/sing-box"
-  [[ -x "$b" ]] || b="$(command -v sing-box 2>/dev/null || true)"
-  printf "%s" "$b"
-}
-_sb_cfg() { printf "%s" "${CONFIG:-/etc/sing-box/config.json}"; }
-
-# 任一入站端口开始监听即视为 OK
-_sb_any_port_listening() {
-  local cfg="$(_sb_cfg)"
-  [[ -s "$cfg" ]] || return 1
-  local any=""
-  while read -r p; do
-    [[ -z "$p" ]] && continue
-    if ss -ltnp 2>/dev/null | grep -q ":$p "; then any=1; break; fi
-    timeout 1 bash -lc "echo >/dev/tcp/127.0.0.1/$p" >/dev/null 2>&1 && { any=1; break; }
-  done < <(jq -r '.inbounds[].listen_port' "$cfg" 2>/dev/null)
-  [[ -n "$any" ]]
-}
 
 type ok   >/dev/null 2>&1 || ok()   { printf " %s\n" "$*"; }
 type warn >/dev/null 2>&1 || warn() { printf " %s\n" "$*" >&2; }
