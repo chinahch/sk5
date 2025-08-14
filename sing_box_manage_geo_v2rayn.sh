@@ -406,53 +406,44 @@ kill_rogue_singbox() {
   done
 }
 
-restart_singbox() {
-  local BIN; BIN="$(_sb_bin)"
-  local CFG; CFG="$(_sb_cfg)"
+# 合并：系统检测与修复（给出建议并可一键执行）
+check_and_repair_menu() {
+  say "====== 系统检测与修复（合并） ======"
+  system_check
+  local status=$?
+  local did_fix=0
 
-  if command -v systemctl >/dev/null 2>&1; then
-    timeout 8s systemctl stop sing-box >/dev/null 2>&1 || true
-    systemctl kill -s SIGKILL sing-box >/dev/null 2>&1 || true
-    sleep 0.4
-    if ! "$BIN" check -c "$CFG" >/dev/null 2>&1; then
-      err "配置文件校验失败：$CFG"; "$BIN" check -c "$CFG" || true; return 1
+  if (( status != 0 )); then
+    say ""
+    warn "检测到异常，建议执行自动修复（安装缺依赖 / 修复服务 / 纠正证书等）。"
+    read -rp "是否立即按建议修复？(Y/n): " dofix
+    dofix=${dofix:-Y}
+    if [[ "$dofix" == "Y" || "$dofix" == "y" ]]; then
+      fix_errors
+      did_fix=1
+      say ""
+      ok "修复操作完成，正在重新检测..."
+      system_check
+    else
+      say "已跳过修复。"
     fi
-    systemctl start sing-box --no-block >/dev/null 2>&1 || true
-    local okflag=0
-    for i in $(seq 1 30); do
-      systemctl is-active --quiet sing-box && { okflag=1; break; }
-      _sb_any_port_listening && { okflag=1; break; }
-      sleep 0.5
-    done
-    if (( okflag==1 )); then ok "Sing-box 重启完成（systemd）"; return 0; fi
-    warn "当前环境虽有 systemctl，但重启失败；切换 fallback 后台运行"
-  elif command -v rc-service >/dev/null 2>&1 && [[ -f /etc/init.d/sing-box ]]; then
-    # OpenRC 环境：使用 rc-service 重启
-    rc-service sing-box restart >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || true
-    local okflag=0
-    for i in $(seq 1 30); do
-      rc-service sing-box status 2>/dev/null | grep -q started && { okflag=1; break; }
-      _sb_any_port_listening && { okflag=1; break; }
-      sleep 0.5
-    done
-    if (( okflag==1 )); then ok "Sing-box 重启完成（OpenRC）"; return 0; fi
-    warn "OpenRC 服务重启失败；切换 fallback 后台运行"
+  else
+    ok "系统状态良好，无需修复。"
   fi
 
-  pkill -9 -f "$BIN run -c $CFG" 2>/dev/null || true
-  pkill -9 -x sing-box 2>/dev/null || true
-  install_singleton_wrapper
-  install_autostart_fallback
-  start_singbox_singleton_force
+  if (( did_fix == 1 )); then
+    say "正在重启 Sing-box 服务以应用修复..."
+    if ! restart_singbox; then
+      warn "自动重启失败，请在“脚本服务”中手动选择 2) 重启 Sing-box 服务。"
+    else
+      ok "Sing-box 服务已重启。"
+    fi
+  fi
 
-  for i in $(seq 1 30); do
-    _sb_any_port_listening && { ok "Sing-box 重启完成（fallback 后台）"; return 0; }
-    sleep 0.5
-  done
-  err "Sing-box 重启失败（fallback 也未监听），请查看 /var/log/sing-box.log"
-  return 1
+  # 等待用户确认后返回上一层菜单（不退出脚本）
+  read -rp "修复完成，按回车返回脚本服务菜单..." _
+  return
 }
-
 install_systemd_service() {
   local SERVICE_FILE="/etc/systemd/system/sing-box.service"
   mkdir -p /etc/systemd/system
@@ -920,7 +911,6 @@ update_singbox() {
     warn "自动重启失败，请在“脚本服务”中手动选择 2) 重启 Sing-box 服务。"
   fi
 }
-
 reinstall_menu() {
   echo "====== 卸载 / 重装 Sing-box ======"
   echo "1) 完全卸载（清空所有服务）"
@@ -970,8 +960,7 @@ reinstall_menu() {
       echo " 正在重新安装 Sing-box（保留节点配置）..."
       bash <(curl -fsSL https://sing-box.app/install.sh)
       echo " Sing-box 已重新安装完成（节点已保留）"
-
-      # 重新安装后，确保服务被正确安装并重启
+    # 重新安装后，确保服务被正确安装并重启
       case "$(detect_init_system)" in
         systemd) install_systemd_service ;;
         openrc)  ensure_service_openrc ;;
@@ -985,8 +974,10 @@ reinstall_menu() {
       ;;
     0) return ;;
     *) echo "无效选择" ;;
+  
   esac
 }
+
 
 system_check() {
   local issues=0
@@ -1083,44 +1074,53 @@ fix_errors() {
   shopt -u nullglob
 }
 
-# 合并：系统检测与修复（给出建议并可一键执行）
-check_and_repair_menu() {
-  say "====== 系统检测与修复（合并） ======"
-  system_check
-  local status=$?
-  local did_fix=0
+restart_singbox() {
+  local BIN; BIN="$(_sb_bin)"
+  local CFG; CFG="$(_sb_cfg)"
 
-  if (( status != 0 )); then
-    say ""
-    warn "检测到异常，建议执行自动修复（安装缺依赖 / 修复服务 / 纠正证书等）。"
-    read -rp "是否立即按建议修复？(Y/n): " dofix
-    dofix=${dofix:-Y}
-    if [[ "$dofix" == "Y" || "$dofix" == "y" ]]; then
-      fix_errors
-      did_fix=1
-      say ""
-      ok "修复操作完成，正在重新检测..."
-      system_check
-    else
-      say "已跳过修复。"
+  if command -v systemctl >/dev/null 2>&1; then
+    pkill -9 sing-box >/dev/null 2>&1 || true
+    systemctl kill -s SIGKILL sing-box >/dev/null 2>&1 || true
+    sleep 0.4
+    if ! "$BIN" check -c "$CFG" >/dev/null 2>&1; then
+      err "配置文件校验失败：$CFG"; "$BIN" check -c "$CFG" || true; return 1
     fi
-  else
-    ok "系统状态良好，无需修复。"
+    nohup sing-box run -c /etc/sing-box/config.json > /var/log/sing-box.log 2>&1 &
+    local okflag=0
+    for i in $(seq 1 30); do
+      systemctl is-active --quiet sing-box && { okflag=1; break; }
+      _sb_any_port_listening && { okflag=1; break; }
+      sleep 0.5
+    done
+    if (( okflag==1 )); then ok "Sing-box 重启完成（systemd）"; return 0; fi
+    warn "当前环境虽有 systemctl，但重启失败；切换 fallback 后台运行"
+  elif command -v rc-service >/dev/null 2>&1 && [[ -f /etc/init.d/sing-box ]]; then
+    # OpenRC 环境：使用 rc-service 重启
+    rc-service sing-box restart >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || true
+    local okflag=0
+    for i in $(seq 1 30); do
+      rc-service sing-box status 2>/dev/null | grep -q started && { okflag=1; break; }
+      _sb_any_port_listening && { okflag=1; break; }
+      sleep 0.5
+    done
+    if (( okflag==1 )); then ok "Sing-box 重启完成（OpenRC）"; return 0; fi
+    warn "OpenRC 服务重启失败；切换 fallback 后台运行"
   fi
 
-  if (( did_fix == 1 )); then
-    say "正在重启 Sing-box 服务以应用修复..."
-    if ! restart_singbox; then
-      warn "自动重启失败，请在“脚本服务”中手动选择 2) 重启 Sing-box 服务。"
-    else
-      ok "Sing-box 服务已重启。"
-    fi
-  fi
+  pkill -9 -f "$BIN run -c $CFG" 2>/dev/null || true
+  pkill -9 -x sing-box 2>/dev/null || true
+  install_singleton_wrapper
+  install_autostart_fallback
+  start_singbox_singleton_force
 
-  # 等待用户确认后返回上一层菜单（不退出脚本）
-  read -rp "修复完成，按回车返回脚本服务菜单..." _
-  return
+  for i in $(seq 1 30); do
+    _sb_any_port_listening && { ok "Sing-box 重启完成（fallback 后台）"; return 0; }
+    sleep 0.5
+  done
+  err "Sing-box 重启失败（fallback 也未监听），请查看 /var/log/sing-box.log"
+  return 1
 }
+
 
 # ============= 节点操作（含 NAT 端口约束） =============
 add_node() {
