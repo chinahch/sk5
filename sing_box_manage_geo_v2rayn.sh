@@ -1073,8 +1073,9 @@ fix_errors() {
         openssl req -new -x509 -nodes -key /etc/hysteria2/${port}.key -out /etc/hysteria2/${port}.crt -subj "/CN=bing.com" -days 36500 >/dev/null 2>&1 || true
         [[ -f /etc/hysteria2/${port}.crt && -f /etc/hysteria2/${port}.key ]] && ok "已重新生成端口 $port 证书"
       fi
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      systemctl restart "$name" >/dev/null 2>&1 || true
+      systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable hysteria2-${PORT}.service >/dev/null 2>&1 || true
+    systemctl restart hysteria2-${PORT}.service >/dev/null 2>&1 || true
       sleep 1
       systemctl is-active --quiet "$name" && ok "Hysteria2-${port} 服务已启动" || err "Hysteria2-${port} 服务仍无法启动"
     fi
@@ -1117,7 +1118,7 @@ check_and_repair_menu() {
   fi
 
   # 等待用户确认后返回上一层菜单（不退出脚本）
-  read -rp "按回车返回脚本服务菜单..." _
+  read -rp "修复完成，按回车返回脚本服务菜单..." _
   return
 }
 
@@ -1605,21 +1606,23 @@ show_version_info() {
 
 # ============= 脚本服务菜单 =============
 script_services_menu() {
-  say "====== 脚本服务 ======"
-  say "1) 检测并修复（系统检测 + 建议 + 一键修复）"
-  say "2) 重启 Sing-box 服务"
-  say "3) 检查并更新 Sing-box 到最新版"
-  say "4) 完全卸载 / 初始化重装"
-  say "0) 返回"
-  read -rp "请选择: " op
-  case "$op" in
-    1) check_and_repair_menu ;;
-    2) restart_singbox ;;
-    3) update_singbox ;;
-    4) reinstall_menu ;;
-    0) return ;;
-    *) warn "无效输入" ;;
-  esac
+  while true; do
+    say "====== 脚本服务 ======"
+    say "1) 检测并修复（系统检测 + 建议 + 一键修复）"
+    say "2) 重启 Sing-box 服务"
+    say "3) 检查并更新 Sing-box 到最新版"
+    say "4) 完全卸载 / 初始化重装"
+    say "0) 返回主菜单"
+    read -rp "请选择: " op
+    case "$op" in
+      1) ( check_and_repair_menu ) || true ;;   # 在子shell中运行，即使出错也不会退出整个脚本
+      2) ( restart_singbox ) || true ;;
+      3) ( update_singbox ) || true ;;
+      4) ( reinstall_menu ) || true ;;
+      0) break ;;
+      *) warn "无效输入" ;;
+    esac
+  done
 }
 
 # ============= 主菜单 =============
