@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 # === Ctrl+C 安全处理 & 守护启动工具 ===
 # === Ctrl+C 安全处理（只退菜单，不清理/不杀服务） ===
-_INT_MSG_SHOWN=0
+
 on_int_menu_quit_only() {
-  if [[ ${_INT_MSG_SHOWN} -eq 0 ]]; then
-    printf "\n(提示) 捕获到 Ctrl+C：仅退出菜单，后台 sing-box/守护不受影响。\n"
-  fi
-  _INT_MSG_SHOWN=1
-  trap - EXIT        # 关键：清空 EXIT trap，避免触发清理逻辑误杀服务
+  restart_singbox >/dev/null 2>&1  # 静默重启 sing-box
+  trap - EXIT  # 清空 EXIT trap
   exit 0
 }
 trap on_int_menu_quit_only INT
@@ -144,11 +141,18 @@ umask 022
 CONFIG="/etc/sing-box/config.json"
 META="/etc/sing-box/nodes_meta.json"
 NAT_FILE="/etc/sing-box/nat_ports.json"
+LOG_FILE="/var/log/sing-box.log"
+
+DEPS_CHECKED=0  # 新增全局标志，避免重复依赖检查
 
 say()  { printf "%s\n" "$*"; }
 err()  { printf " %s\n" "$*" >&2; }
 ok()   { printf " %s\n" "$*"; }
 warn() { printf " %s\n" "$*" >&2; }
+log_msg() {
+  local level="$1" msg="$2"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg" >> "$LOG_FILE"
+}
 
 # ============= 基础工具 =============
 detect_os() {
@@ -201,6 +205,39 @@ ensure_dirs() {
   [[ -f "$META"   ]] || printf '%s\n' '{}' >"$META"
 }
 
+# 合并依赖安装
+install_deps() {
+  local deps=("$@")
+  local os="$(detect_os)"
+  local installed=0
+  for cmd in "${deps[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      case "$os" in
+        debian|ubuntu)
+          DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || log_msg "WARN" "apt update failed"
+          DEBIAN_FRONTEND=noninteractive apt-get install -y "$cmd" >/dev/null 2>&1 || log_msg "WARN" "Failed to install $cmd on $os"
+          ;;
+        alpine)
+          apk add --no-cache "$cmd" >/dev/null 2>&1 || log_msg "WARN" "Failed to install $cmd on $os"
+          ;;
+        centos|rhel)
+          yum install -y "$cmd" >/dev/null 2>&1 || log_msg "WARN" "Failed to install $cmd on $os"
+          ;;
+        fedora)
+          dnf install -y "$cmd" >/dev/null 2>&1 || log_msg "WARN" "Failed to install $cmd on $os"
+          ;;
+        *) log_msg "WARN" "Unknown OS, cannot install $cmd" ;;
+      esac
+      installed=1
+    fi
+  done
+  if (( installed == 1 )); then
+    ok "Dependencies installed/checked: ${deps[*]}"
+  else
+    ok "All dependencies satisfied"
+  fi
+}
+
 install_dependencies() {
   local need=()
   command -v curl >/dev/null 2>&1    || need+=("curl")
@@ -251,7 +288,6 @@ ensure_cmd() {
   esac
   command -v "$cmd" >/dev/null 2>&1
 }
-
 # —— 新增：在需要用到前“兜底安装”关键依赖（多次调用无副作用）——
 ensure_runtime_deps() {
   # curl / jq / uuidgen / openssl / ss / lsof
@@ -264,7 +300,6 @@ ensure_runtime_deps() {
   ensure_cmd ss       iproute2     iproute2    iproute    iproute
   ensure_cmd lsof     lsof         lsof        lsof        lsof
 }
-
 install_singbox_if_needed() {
   if command -v sing-box >/dev/null 2>&1; then return 0; fi
 
@@ -274,7 +309,7 @@ install_singbox_if_needed() {
       if command -v apk >/dev/null 2>&1; then
         apk update 2>/dev/null || true
         apk add --no-cache ca-certificates
-        update-ca-certificates 2>/dev/null || true
+        update-ca-certificates 2>/dev/null || log_msg "WARN" "update-ca-certificates failed"
       elif command -v apt-get >/dev/null 2>&1; then
         apt-get update -y
         apt-get install --reinstall -y ca-certificates
@@ -302,6 +337,7 @@ install_singbox_if_needed() {
   fix_ca_certificates
 
   local tmp; tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
   (
     set -e
     cd "$tmp"
@@ -313,8 +349,7 @@ install_singbox_if_needed() {
     fi
     tar -xzf "$FILE"
     install -m 0755 "sing-box-${VERSION}-linux-${arch}/sing-box" /usr/local/bin/sing-box
-  ) || { err "安装 sing-box 失败"; rm -rf "$tmp"; return 1; }
-  rm -rf "$tmp"
+  ) || { err "安装 sing-box 失败"; return 1; }
   ok "sing-box 安装完成"
 }
 
@@ -324,9 +359,11 @@ get_country_code() {
   CODE=$(curl -s --max-time 3 https://ipinfo.io | jq -r '.country // empty')
   [[ "$CODE" =~ ^[A-Z]{2}$ ]] && printf "%s\n" "$CODE" || printf "ZZ\n"
 }
+
 get_ipv6_address() {
   ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' | cut -d/ -f1 | head -n1
 }
+
 generate_unique_tag() {
   local base="vless-reality-$(get_country_code)"
   local try=0 RAND CANDIDATE
@@ -370,6 +407,94 @@ port_status() {
   if (( seen_s==1 )); then return 0; elif (( seen_o==1 )); then return 1; else return 2; fi
 }
 
+# 预加载 NAT 数据
+load_nat_data() {
+  if [[ -f "$NAT_FILE" ]]; then
+    nat_mode=$(jq -r '.mode // "custom"' "$NAT_FILE")
+    mapfile -t nat_ranges < <(jq -r '.ranges[]?' "$NAT_FILE")
+    mapfile -t nat_tcp < <(jq -r '.custom_tcp[]?' "$NAT_FILE" | sort -n -u)
+    mapfile -t nat_udp < <(jq -r '.custom_udp[]?' "$NAT_FILE" | sort -n -u)
+  else
+    nat_mode=""
+    nat_ranges=()
+    nat_tcp=()
+    nat_udp=()
+  fi
+}
+
+get_random_allowed_port() {
+  local proto="$1"
+  local -a used=()
+  mapfile -t used < <(jq -r '.inbounds[].listen_port' "$CONFIG" 2>/dev/null | grep -E '^[0-9]+$' || true)
+  mapfile -t hy2u < <(jq -r 'to_entries[]? | select(.value.type=="hysteria2") | .value.port' "$META" 2>/dev/null || true)
+  used+=("${hy2u[@]}")
+
+  local -a candidates=()
+  if [[ -n "$nat_mode" ]]; then
+    if [[ "$nat_mode" == "range" ]]; then
+      for range in "${nat_ranges[@]}"; do
+        local s=${range%-*} e=${range#*-} p
+        for ((p=s; p<=e; p++)); do candidates+=("$p"); done
+      done
+    else
+      if [[ "$proto" == "tcp" ]]; then
+        candidates=("${nat_tcp[@]}")
+      elif [[ "$proto" == "udp" ]]; then
+        candidates=("${nat_udp[@]}")
+      else
+        candidates=("${nat_tcp[@]}" "${nat_udp[@]}")
+      fi
+    fi
+    local free=() usedset=" ${used[*]} "
+    for c in "${candidates[@]}"; do
+      [[ "$usedset" == *" $c "* ]] && continue
+      free+=("$c")
+    done
+    if ((${#free[@]}==0)); then echo "NO_PORT"; return 1; fi
+    echo "${free[RANDOM % ${#free[@]}]}"; return 0
+  else
+    if [[ "$proto" == "tcp" ]]; then
+      echo $((RANDOM%10000 + 30000))
+    elif [[ "$proto" == "udp" ]]; then
+      echo $((RANDOM%10000 + 50000))
+    else
+      echo $((RANDOM%1000 + 30000))
+    fi
+  fi
+}
+
+check_nat_allow() {
+  local port="$1" proto="$2"
+  if [[ -z "$nat_mode" ]]; then return 0; fi
+  if [[ "$nat_mode" == "range" ]]; then
+    for range in "${nat_ranges[@]}"; do
+      local s=${range%-*} e=${range#*-}
+      if (( port >= s && port <= e )); then return 0; fi
+    done
+    return 1
+  elif [[ "$nat_mode" == "custom" ]]; then
+    local arr=()
+    if [[ "$proto" == "tcp" ]]; then arr=("${nat_tcp[@]}")
+    elif [[ "$proto" == "udp" ]]; then arr=("${nat_udp[@]}")
+    else arr=("${nat_tcp[@]}" "${nat_udp[@]}")
+    fi
+    printf '%s\n' "${arr[@]}" | grep -qx "$port"; return $?
+  else
+    return 0
+  fi
+}
+
+# 生成自签证书函数
+generate_self_signed_cert() {
+  local key_file="$1" cert_file="$2" domain="$3"
+  umask 077
+  openssl ecparam -name prime256v1 -genkey -noout -out "$key_file" 2>/dev/null || \
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out "$key_file" 2>/dev/null
+  openssl req -new -x509 -nodes -key "$key_file" -out "$cert_file" -subj "/CN=$domain" -days 36500 >/dev/null 2>&1
+  chmod 600 "$key_file" "$cert_file"
+  if [[ -f "$cert_file" && -f "$key_file" ]]; then return 0; else return 1; fi
+}
+
 # ============= systemd/OpenRC =============
 ensure_service_openrc() {
   cat <<'EOF' >/etc/init.d/sing-box
@@ -392,8 +517,8 @@ start_pre() {
 }
 EOF
   chmod +x /etc/init.d/sing-box
-  rc-update add sing-box default >/dev/null 2>&1 || true
-  rc-service sing-box restart >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || true
+  rc-update add sing-box default >/dev/null 2>&1 || log_msg "WARN" "rc-update failed"
+  rc-service sing-box restart >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || log_msg "WARN" "rc-service start failed"
 }
 
 kill_rogue_singbox() {
@@ -466,8 +591,8 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable --now sing-box >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || log_msg "WARN" "daemon-reload failed"
+  systemctl enable --now sing-box >/dev/null 2>&1 || log_msg "WARN" "enable sing-box failed"
 
   local okflag=0
   for i in $(seq 1 20); do
@@ -486,7 +611,7 @@ EOF
     _sb_any_port_listening && { ok "fallback 已启动 sing-box（后台）"; return 0; }
     sleep 0.5
   done
-  err "fallback 启动失败，请检查 /var/log/sing-box.log"
+  err "fallback 启动失败，请检查 $LOG_FILE"
   return 1
 }
 
@@ -502,7 +627,7 @@ ensure_rc_local_template() {
     cat > "$rc" <<'RC'
 #!/bin/sh -e
 sleep 1
-/usr/local/bin/sb-singleton >> /var/log/sing-box.log 2>&1 &
+/usr/local/bin/sb-singleton >> $LOG_FILE 2>&1 &
 exit 0
 RC
     chmod +x "$rc"
@@ -510,7 +635,7 @@ RC
     grep -q '^#!/bin/sh' "$rc" || sed -i '1i #!/bin/sh -e' "$rc"
     grep -q '^exit 0$' "$rc" || printf '\nexit 0\n' >> "$rc"
     if ! grep -q '/usr/local/bin/sb-singleton' "$rc"; then
-      sed -i '/^exit 0/i /usr/local/bin/sb-singleton >> /var/log/sing-box.log 2>&1 &' "$rc"
+      sed -i '/^exit 0/i /usr/local/bin/sb-singleton >> $LOG_FILE 2>&1 &' "$rc"
     fi
     grep -q '^sleep 1$' "$rc" || sed -i '1a sleep 1' "$rc"
     chmod +x "$rc"
@@ -586,28 +711,13 @@ install_autostart_fallback() {
     mkdir -p /etc/local.d
     cat > /etc/local.d/sb-singbox.start <<'EOL'
 #!/bin/sh
-/usr/local/bin/sb-singleton >> /var/log/sing-box.log 2>&1 &
+/usr/local/bin/sb-singleton >> $LOG_FILE 2>&1 &
 EOL
     chmod +x /etc/local.d/sb-singbox.start
-    rc-update add local default >/dev/null 2>&1 || true
+    rc-update add local default >/dev/null 2>&1 || log_msg "WARN" "rc-update failed"
   else
     # 其他系统：使用 rc.local
-    if [[ ! -f /etc/rc.local ]]; then
-      cat > /etc/rc.local <<'RC'
-#!/bin/sh -e
-sleep 1
-/usr/local/bin/sb-singleton >> /var/log/sing-box.log 2>&1 &
-exit 0
-RC
-      chmod +x /etc/rc.local
-    else
-      grep -q '^#!/bin/sh' /etc/rc.local || sed -i '1i #!/bin/sh -e' /etc/rc.local
-      grep -q '^exit 0$' /etc/rc.local || printf '\nexit 0\n' >> /etc/rc.local
-      grep -q '/usr/local/bin/sb-singleton' /etc/rc.local || \
-        sed -i '/^exit 0/i /usr/local/bin/sb-singleton >> /var/log/sing-box.log 2>&1 &' /etc/rc.local
-      grep -q '^sleep 1$' /etc/rc.local || sed -i '1a sleep 1' /etc/rc.local
-      chmod +x /etc/rc.local
-    fi
+    ensure_rc_local_template
   fi
 
   # 添加 Cron 看门狗 (@reboot + 每分钟)，防止进程退出
@@ -636,7 +746,6 @@ start_singbox_singleton_force() {
   daemonize /usr/local/bin/sb-singleton --force
 }
 
-# ============= NAT 规则存取/校验 =============
 # ============= NAT 规则存取/校验（清爽展示 + 左右分栏菜单） =============
 view_nat_ports() {
   if [[ ! -f "$NAT_FILE" ]]; then
@@ -663,35 +772,25 @@ view_nat_ports() {
     (( i % cols != 0 )) && printf "\n"
   }
 
-  local mode; mode=$(jq -r '.mode // "custom"' "$NAT_FILE")
+  local mode; mode="$nat_mode"
   # 分拆打印，彻底规避选项误判
   printf "%s" "$BOLD"; printf "%s" "当前 NAT 模式:"; printf "%s" "$C_END"; printf " %s\n\n" "$mode"
 
-  # 读取数据
-  local -a ranges tcp udp
-  mapfile -t ranges < <(jq -r '.ranges[]?' "$NAT_FILE")
-  mapfile -t tcp    < <(jq -r '.custom_tcp[]?' "$NAT_FILE")
-  mapfile -t udp    < <(jq -r '.custom_udp[]?' "$NAT_FILE")
-
-  # 范围端口
-  if ((${#ranges[@]})); then
+  # 使用预加载数据
+  if ((${#nat_ranges[@]})); then
     printf "%s%s范围端口:%s\n" "$BOLD" "$C_CYAN" "$C_END"
-    _print_grid 4 13 "${ranges[@]}"
+    _print_grid 4 13 "${nat_ranges[@]}"
     printf "\n"
   fi
 
-  # 自定义 TCP
-  if ((${#tcp[@]})); then
-    mapfile -t tcp < <(printf '%s\n' "${tcp[@]}" | grep -E '^[0-9]+$' | sort -n -u)
+  if ((${#nat_tcp[@]})); then
     printf "%s%s自定义 TCP 端口:%s\n" "$BOLD" "$C_GRN" "$C_END"
-    _print_grid 8 6 "${tcp[@]}"; printf "\n"
+    _print_grid 8 6 "${nat_tcp[@]}"; printf "\n"
   fi
 
-  # 自定义 UDP
-  if ((${#udp[@]})); then
-    mapfile -t udp < <(printf '%s\n' "${udp[@]}" | grep -E '^[0-9]+$' | sort -n -u)
+  if ((${#nat_udp[@]})); then
     printf "%s%s自定义 UDP 端口:%s\n" "$BOLD" "$C_YLW" "$C_END"
-    _print_grid 8 6 "${udp[@]}"; printf "\n"
+    _print_grid 8 6 "${nat_udp[@]}"; printf "\n"
   fi
 
   # 菜单（同样用 * 指定宽度）
@@ -709,48 +808,60 @@ view_nat_ports() {
       read -rp "输入范围段: " ranges_in
       [[ -z "$ranges_in" ]] && { warn "未输入"; return; }
       local tmp; tmp=$(mktemp)
+      trap 'rm -f "$tmp"' EXIT
       jq --argjson arr "$(printf '%s\n' "$ranges_in" | jq -R 'split(" ")')" \
          '.mode="range"|.ranges=((.ranges//[])+$arr)|.custom_tcp=(.custom_tcp//[])|.custom_udp=(.custom_udp//[])' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
+      load_nat_data  # 重新加载 NAT 数据
       ok "已添加范围段"
       ;;
     2)
       read -rp "输入要删除的范围段（完全匹配）: " seg
       [[ -z "$seg" ]] && { warn "未输入"; return; }
       local tmp; tmp=$(mktemp)
+      trap 'rm -f "$tmp"' EXIT
       jq --arg seg "$seg" '.ranges=((.ranges//[])|map(select(.!=$seg)))' "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
+      load_nat_data
       ok "已删除范围段"
       ;;
     3)
       read -rp "输入要添加的TCP端口（空格分隔）: " ports
       local tmp; tmp=$(mktemp)
+      trap 'rm -f "$tmp"' EXIT
       jq --argjson add "$(printf '%s\n' "$ports" | jq -R 'split(" ")|map(tonumber)')" \
          '.mode="custom"|.custom_tcp=((.custom_tcp//[])+$add)|.custom_udp=(.custom_udp//[])|.ranges=[]' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
+      load_nat_data
       ok "已添加TCP端口"
       ;;
     4)
       read -rp "输入要删除的TCP端口（空格分隔）: " ports
       local tmp; tmp=$(mktemp)
+      trap 'rm -f "$tmp"' EXIT
       jq --argjson del "$(printf '%s\n' "$ports" | jq -R 'split(" ")|map(tonumber)')" \
          '.custom_tcp=((.custom_tcp//[])|map(select(( $del|index(.) )|not )))' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
+      load_nat_data
       ok "已删除TCP端口"
       ;;
     5)
       read -rp "输入要添加的UDP端口（空格分隔）: " ports
       local tmp; tmp=$(mktemp)
+      trap 'rm -f "$tmp"' EXIT
       jq --argjson add "$(printf '%s\n' "$ports" | jq -R 'split(" ")|map(tonumber)')" \
          '.mode="custom"|.custom_udp=((.custom_udp//[])+$add)|.custom_tcp=(.custom_tcp//[])|.ranges=[]' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
+      load_nat_data
       ok "已添加UDP端口"
       ;;
     6)
       read -rp "输入要删除的UDP端口（空格分隔）: " ports
       local tmp; tmp=$(mktemp)
+      trap 'rm -f "$tmp"' EXIT
       jq --argjson del "$(printf '%s\n' "$ports" | jq -R 'split(" ")|map(tonumber)')" \
          '.custom_udp=((.custom_udp//[])|map(select(( $del|index(.) )|not )))' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
+      load_nat_data
       ok "已删除UDP端口"
       ;;
     0) return ;;
@@ -759,36 +870,46 @@ view_nat_ports() {
 }
 
 disable_nat_mode() {
-  if [[ -f "$NAT_FILE" ]]; then rm -f "$NAT_FILE"; ok "NAT 模式已关闭（规则已清除）"
+  if [[ -f "$NAT_FILE" ]]; then rm -f "$NAT_FILE"; load_nat_data; ok "NAT 模式已关闭（规则已清除）"
   else warn "当前未启用 NAT 模式"; fi
 }
 
 set_nat_range() {
   read -rp "请输入范围端口（多个用空格分隔，如 12000-12020 34050-34070）: " ranges
+  local tmp; tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
   jq -n --argjson arr "$(printf '%s\n' "$ranges" | jq -R 'split(" ")')" \
-    '{"mode":"range","ranges":$arr,"custom_tcp":[],"custom_udp":[]}' > "$NAT_FILE"
+    '{"mode":"range","ranges":$arr,"custom_tcp":[],"custom_udp":[]}' > "$tmp"
+  mv "$tmp" "$NAT_FILE"
+  load_nat_data
   ok "范围端口已保存"
 }
 set_nat_custom_tcp() {
-  local nat_file="/etc/sing-box/nat_ports.json"
   read -rp "请输入自定义TCP端口（空格分隔）: " ports
-  if [[ -f "$nat_file" ]]; then
-    jq --argjson arr "$(printf '%s\n' "$ports" | jq -R 'split(" ") | map(tonumber)')" '.custom_tcp = $arr' "$nat_file" > "${nat_file}.tmp" && mv "${nat_file}.tmp" "$nat_file"
+  local tmp; tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
+  if [[ -f "$NAT_FILE" ]]; then
+    jq --argjson arr "$(printf '%s\n' "$ports" | jq -R 'split(" ") | map(tonumber)')" '.custom_tcp = $arr' "$NAT_FILE" > "$tmp"
   else
-    jq -n --argjson arr "$(printf '%s\n' "$ports" | jq -R 'split(" ") | map(tonumber)')" '{"mode":"custom","ranges":[],"custom_tcp":$arr,"custom_udp":[]}' > "$nat_file"
+    jq -n --argjson arr "$(printf '%s\n' "$ports" | jq -R 'split(" ") | map(tonumber)')" '{"mode":"custom","ranges":[],"custom_tcp":$arr,"custom_udp":[]}' > "$tmp"
   fi
-  echo "自定义TCP端口已保存"
+  mv "$tmp" "$NAT_FILE"
+  load_nat_data
+  ok "自定义TCP端口已保存"
 }
 
 set_nat_custom_udp() {
-  local nat_file="/etc/sing-box/nat_ports.json"
   read -rp "请输入自定义UDP端口（空格分隔）: " ports
-  if [[ -f "$nat_file" ]]; then
-    jq --argjson arr "$(printf '%s\n' "$ports" | jq -R 'split(" ") | map(tonumber)')" '.custom_udp = $arr' "$nat_file" > "${nat_file}.tmp" && mv "${nat_file}.tmp" "$nat_file"
+  local tmp; tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
+  if [[ -f "$NAT_FILE" ]]; then
+    jq --argjson arr "$(printf '%s\n' "$ports" | jq -R 'split(" ") | map(tonumber)')" '.custom_udp = $arr' "$NAT_FILE" > "$tmp"
   else
-    jq -n --argjson arr "$(printf '%s\n' "$ports" | jq -R 'split(" ") | map(tonumber)')" '{"mode":"custom","ranges":[],"custom_tcp":[],"custom_udp":$arr}' > "$nat_file"
+    jq -n --argjson arr "$(printf '%s\n' "$ports" | jq -R 'split(" ") | map(tonumber)')" '{"mode":"custom","ranges":[],"custom_tcp":[],"custom_udp":$arr}' > "$tmp"
   fi
-  echo "自定义UDP端口已保存"
+  mv "$tmp" "$NAT_FILE"
+  load_nat_data
+  ok "自定义UDP端口已保存"
 }
 
 nat_mode_menu() {
@@ -811,72 +932,6 @@ nat_mode_menu() {
   esac
 }
 
-# 协议感知校验：范围模式允许范围内所有端口；自定义模式区分 TCP/UDP 集合
-check_nat_allow() {
-  local port="$1" proto="$2"
-  if [[ ! -f "$NAT_FILE" ]]; then return 0; fi
-  local mode; mode=$(jq -r '.mode' "$NAT_FILE")
-  if [[ "$mode" == "range" ]]; then
-    while read -r range; do
-      local s=${range%-*} e=${range#*-}
-      if (( port>=s && port<=e )); then return 0; fi
-    done < <(jq -r '.ranges[]?' "$NAT_FILE")
-    return 1
-  elif [[ "$mode" == "custom" ]]; then
-    if [[ "$proto" == "tcp" ]]; then
-      jq -r '.custom_tcp[]?' "$NAT_FILE" | grep -qx "$port"; return $?
-    elif [[ "$proto" == "udp" ]]; then
-      jq -r '.custom_udp[]?' "$NAT_FILE" | grep -qx "$port"; return $?
-    else
-      jq -r '.custom_tcp[]?, .custom_udp[]?' "$NAT_FILE" | grep -qx "$port"; return $?
-    fi
-  else
-    return 0
-  fi
-}
-
-get_random_allowed_port() {
-  local proto="$1"
-  local -a used=()
-  mapfile -t used < <(jq -r '.inbounds[].listen_port' "$CONFIG" 2>/dev/null | grep -E '^[0-9]+$' || true)
-  mapfile -t hy2u < <(jq -r 'to_entries[]? | select(.value.type=="hysteria2") | .value.port' "$META" 2>/dev/null || true)
-  used+=("${hy2u[@]}")
-
-  if [[ -f "$NAT_FILE" ]]; then
-    local mode; mode=$(jq -r '.mode' "$NAT_FILE")
-    local -a candidates=()
-    if [[ "$mode" == "range" ]]; then
-      while read -r range; do
-        local s=${range%-*} e=${range#*-} p
-        for ((p=s; p<=e; p++)); do candidates+=("$p"); done
-      done < <(jq -r '.ranges[]?' "$NAT_FILE")
-    else
-      if [[ "$proto" == "tcp" ]]; then
-        mapfile -t candidates < <(jq -r '.custom_tcp[]?' "$NAT_FILE")
-      elif [[ "$proto" == "udp" ]]; then
-        mapfile -t candidates < <(jq -r '.custom_udp[]?' "$NAT_FILE")
-      else
-        mapfile -t candidates < <(jq -r '.custom_tcp[]?, .custom_udp[]?' "$NAT_FILE")
-      fi
-    fi
-    local free=() usedset=" ${used[*]} "
-    for c in "${candidates[@]}"; do
-      [[ "$usedset" == *" $c "* ]] && continue
-      free+=("$c")
-    done
-    if ((${#free[@]}==0)); then echo "NO_PORT"; return 1; fi
-    echo "${free[RANDOM % ${#free[@]}]}"; return 0
-  else
-    if [[ "$proto" == "tcp" ]]; then
-      echo $((RANDOM%10000 + 30000))
-    elif [[ "$proto" == "udp" ]]; then
-      echo $((RANDOM%10000 + 50000))
-    else
-      echo $((RANDOM%1000 + 30000))
-    fi
-  fi
-}
-
 # ============= 升级/重装/系统检测与修复 =============
 update_singbox() {
   say " 正在检查 Sing-box 更新..."
@@ -890,6 +945,7 @@ update_singbox() {
   read -rp "是否更新到 $LATEST？(y/N): " c; [[ "$c" == "y" ]] || { say "已取消"; return; }
   ARCH=$(uname -m); case "$ARCH" in x86_64|amd64) ARCH="amd64";; aarch64|arm64) ARCH="arm64";; *) err "不支持架构 $ARCH"; return 1;; esac
   tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
   (
     set -e
     cd "$tmp"
@@ -901,8 +957,7 @@ update_singbox() {
     install -m 0755 "sing-box-${LATEST}-linux-${ARCH}/sing-box" /usr/local/bin/sing-box
     [[ "$init" == "systemd" ]] && systemctl start sing-box || true
     [[ "$init" == "openrc"  ]] && rc-service sing-box start >/dev/null 2>&1 || true
-  ) || { err "升级失败"; rm -rf "$tmp"; return 1; }
-  rm -rf "$tmp"
+  ) || { err "升级失败"; return 1; }
   ok "已成功升级为 v${LATEST}"
 
   # 统一保证更新后重启服务，避免失效
@@ -918,7 +973,7 @@ reinstall_menu() {
   echo "0) 返回"
   read -rp "请选择: " choice
   case "$choice" in
-        1)
+    1)
       echo " 即将卸载 Sing-box、Hysteria2 及相关文件（包含本脚本）..."
       read -rp "确认继续 (y/N): " confirm
       [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
@@ -1044,13 +1099,13 @@ fix_errors() {
     local H_VERSION="2.6.2" arch=$(uname -m)
     case "$arch" in x86_64|amd64) arch="amd64";; aarch64|arm64) arch="arm64";; *) err "暂不支持的架构：$arch";; esac
     local tmp; tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
     (
       set -e
       cd "$tmp"
       curl -sSL "https://github.com/apernet/hysteria/releases/download/app/v${H_VERSION}/hysteria-linux-${arch}" -o hysteria-bin || { err "下载 hysteria 失败"; exit 1; }
       install -m 0755 hysteria-bin /usr/local/bin/hysteria
     ) || true
-    rm -rf "$tmp"
     command -v hysteria >/dev/null 2>&1 && ok "hysteria 安装完成"
   fi
 
@@ -1059,14 +1114,11 @@ fix_errors() {
     local port=${name#hysteria2-}; port=${port%.service}
     if ! systemctl is-active --quiet "$name"; then
       if [[ ! -f /etc/hysteria2/${port}.crt || ! -f /etc/hysteria2/${port}.key ]]; then
-        openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria2/${port}.key 2>/dev/null || \
-        openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out /etc/hysteria2/${port}.key 2>/dev/null
-        openssl req -new -x509 -nodes -key /etc/hysteria2/${port}.key -out /etc/hysteria2/${port}.crt -subj "/CN=bing.com" -days 36500 >/dev/null 2>&1 || true
-        [[ -f /etc/hysteria2/${port}.crt && -f /etc/hysteria2/${port}.key ]] && ok "已重新生成端口 $port 证书"
+        generate_self_signed_cert "/etc/hysteria2/${port}.key" "/etc/hysteria2/${port}.crt" "bing.com" && ok "已重新生成端口 $port 证书"
       fi
-      systemctl daemon-reload >/dev/null 2>&1
-    systemctl enable hysteria2-${PORT}.service >/dev/null 2>&1 || true
-    systemctl restart hysteria2-${PORT}.service >/dev/null 2>&1 || true
+      systemctl daemon-reload >/dev/null 2>&1 || log_msg "WARN" "daemon-reload failed"
+      systemctl enable "$name" >/dev/null 2>&1 || log_msg "WARN" "enable $name failed"
+      systemctl restart "$name" >/dev/null 2>&1 || log_msg "WARN" "restart $name failed"
       sleep 1
       systemctl is-active --quiet "$name" && ok "Hysteria2-${port} 服务已启动" || err "Hysteria2-${port} 服务仍无法启动"
     fi
@@ -1075,17 +1127,17 @@ fix_errors() {
 }
 
 restart_singbox() {
-  local BIN; BIN="$(_sb_bin)"
-  local CFG; CFG="$(_sb_cfg)"
+  local bin; bin="$(_sb_bin)"
+  local cfg; cfg="$(_sb_cfg)"
 
   if command -v systemctl >/dev/null 2>&1; then
     pkill -9 sing-box >/dev/null 2>&1 || true
     systemctl kill -s SIGKILL sing-box >/dev/null 2>&1 || true
     sleep 0.4
-    if ! "$BIN" check -c "$CFG" >/dev/null 2>&1; then
-      err "配置文件校验失败：$CFG"; "$BIN" check -c "$CFG" || true; return 1
+    if ! "$bin" check -c "$cfg" >/dev/null 2>&1; then
+      err "配置文件校验失败：$cfg"; "$bin" check -c "$cfg" || true; return 1
     fi
-    nohup sing-box run -c /etc/sing-box/config.json > /var/log/sing-box.log 2>&1 &
+    nohup sing-box run -c /etc/sing-box/config.json > $LOG_FILE 2>&1 &
     local okflag=0
     for i in $(seq 1 30); do
       systemctl is-active --quiet sing-box && { okflag=1; break; }
@@ -1096,7 +1148,7 @@ restart_singbox() {
     warn "当前环境虽有 systemctl，但重启失败；切换 fallback 后台运行"
   elif command -v rc-service >/dev/null 2>&1 && [[ -f /etc/init.d/sing-box ]]; then
     # OpenRC 环境：使用 rc-service 重启
-    rc-service sing-box restart >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || true
+    rc-service sing-box restart >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || log_msg "WARN" "rc-service failed"
     local okflag=0
     for i in $(seq 1 30); do
       rc-service sing-box status 2>/dev/null | grep -q started && { okflag=1; break; }
@@ -1107,7 +1159,7 @@ restart_singbox() {
     warn "OpenRC 服务重启失败；切换 fallback 后台运行"
   fi
 
-  pkill -9 -f "$BIN run -c $CFG" 2>/dev/null || true
+  pkill -9 -f "$bin run -c $cfg" 2>/dev/null || true
   pkill -9 -x sing-box 2>/dev/null || true
   install_singleton_wrapper
   install_autostart_fallback
@@ -1117,7 +1169,7 @@ restart_singbox() {
     _sb_any_port_listening && { ok "Sing-box 重启完成（fallback 后台）"; return 0; }
     sleep 0.5
   done
-  err "Sing-box 重启失败（fallback 也未监听），请查看 /var/log/sing-box.log"
+  err "Sing-box 重启失败（fallback 也未监听），请查看 $LOG_FILE"
   return 1
 }
 
@@ -1132,65 +1184,66 @@ ensure_runtime_deps
     say "1) SOCKS5"
     say "2) VLESS-REALITY"
     say "3) Hysteria2"
-    read -rp "输入协议编号（默认 1，输入 0 返回）: " PROTO
-    PROTO=${PROTO:-1}
-    [[ "$PROTO" == "0" ]] && return
-    [[ "$PROTO" =~ ^[123]$ ]] && break
+    read -rp "输入协议编号（默认 1，输入 0 返回）: " proto
+    proto=${proto:-1}
+    [[ "$proto" == "0" ]] && return
+    [[ "$proto" =~ ^[123]$ ]] && break
     warn "无效输入"
   done
 
-  if [[ "$PROTO" == "3" ]]; then
+  if [[ "$proto" == "3" ]]; then
     add_hysteria2_node || return 1
     return
-  elif [[ "$PROTO" == "2" ]]; then
+  elif [[ "$proto" == "2" ]]; then
     # VLESS (TCP 语义端口)
     if ! command -v sing-box >/dev/null 2>&1; then
       err "未检测到 sing-box，无法生成 Reality 密钥。请先在“脚本服务”里重装/安装。"
       return 1
     fi
-    local PORT mode proto="tcp"
+    local port proto_type="tcp"
     while true; do
-      if [[ -f "$NAT_FILE" ]]; then
-        mode=$(jq -r '.mode' "$NAT_FILE")
-        [[ "$mode" == "custom" ]] && say "已启用自定义端口模式：VLESS 仅允许使用 自定义TCP端口 集合"
-        [[ "$mode" == "range"  ]] && say "已启用范围端口模式：VLESS 仅允许使用 范围内端口"
+      if [[ -n "$nat_mode" ]]; then
+        [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：VLESS 仅允许使用 自定义TCP端口 集合"
+        [[ "$nat_mode" == "range"  ]] && say "已启用范围端口模式：VLESS 仅允许使用 范围内端口"
       fi
-      read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " PORT
-      if [[ -z "$PORT" ]]; then
-        PORT=$(get_random_allowed_port "$proto")
-        [[ "$PORT" == "NO_PORT" ]] && { err "无可用端口"; return 1; }
-        say "（已自动选择随机端口：$PORT）"
+      read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " port
+      if [[ -z "$port" ]]; then
+        port=$(get_random_allowed_port "$proto_type")
+        [[ "$port" == "NO_PORT" ]] && { err "无可用端口"; return 1; }
+        say "（已自动选择随机端口：$port）"
       fi
-      [[ "$PORT" == "0" ]] && return
-      [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT>=1 && PORT<=65535)) || { warn "端口无效"; continue; }
-      if ! check_nat_allow "$PORT" "$proto"; then warn "端口 $PORT 不符合 NAT 规则（协议: $proto）"; continue; fi
-      if jq -e --argjson p "$PORT" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then warn "端口 $PORT 已存在"; continue; fi
-      if jq -e --argjson p "$PORT" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then warn "端口 $PORT 已被 Hysteria2 使用"; continue; fi
+      [[ "$port" == "0" ]] && return
+      [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || { warn "端口无效"; continue; }
+      (( port < 1024 )) && warn "端口<1024可能需root权限"
+      if ! check_nat_allow "$port" "$proto_type"; then warn "端口 $port 不符合 NAT 规则（协议: $proto_type）"; continue; fi
+      if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then warn "端口 $port 已存在"; continue; fi
+      if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then warn "端口 $port 已被 Hysteria2 使用"; continue; fi
       break
     done
 
-    local UUID FP FLOW SERVER_NAME KEY_PAIR PRIVATE_KEY PUBLIC_KEY SHORT_ID TAG tmpcfg
-    if command -v uuidgen >/dev/null 2>&1; then UUID=$(uuidgen); else UUID=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/'); fi
-    SERVER_NAME="www.cloudflare.com"
-    FLOW="xtls-rprx-vision"
-    case $((RANDOM%5)) in 0) FP="chrome";; *) FP="firefox";; esac
+    local uuid fp flow server_name key_pair private_key public_key short_id tag tmpcfg
+    if command -v uuidgen >/dev/null 2>&1; then uuid=$(uuidgen); else uuid=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/'); fi
+    server_name="www.cloudflare.com"
+    flow="xtls-rprx-vision"
+    case $((RANDOM%5)) in 0) fp="chrome";; *) fp="firefox";; esac
 
-    KEY_PAIR=$(sing-box generate reality-keypair 2>/dev/null)
-    PRIVATE_KEY=$(awk -F': ' '/PrivateKey/{print $2}' <<<"$KEY_PAIR")
-    PUBLIC_KEY=$(awk -F': ' '/PublicKey/{print $2}' <<<"$KEY_PAIR")
-    [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]] && { err "生成 Reality 密钥失败"; return 1; }
-    SHORT_ID=$(openssl rand -hex 4)
-    TAG=$(generate_unique_tag)
+    key_pair=$(sing-box generate reality-keypair 2>/dev/null)
+    private_key=$(awk -F': ' '/PrivateKey/{print $2}' <<<"$key_pair")
+    public_key=$(awk -F': ' '/PublicKey/{print $2}' <<<"$key_pair")
+    [[ -z "$private_key" || -z "$public_key" ]] && { err "生成 Reality 密钥失败"; return 1; }
+    short_id=$(openssl rand -hex 4)
+    tag=$(generate_unique_tag)
 
     tmpcfg=$(mktemp)
-    jq --arg port "$PORT" \
-       --arg uuid "$UUID" \
-       --arg prikey "$PRIVATE_KEY" \
-       --arg sid "$SHORT_ID" \
-       --arg server "$SERVER_NAME" \
-       --arg fp "$FP" \
-       --arg flow "$FLOW" \
-       --arg tag "$TAG" \
+    trap 'rm -f "$tmpcfg"' EXIT
+    jq --arg port "$port" \
+       --arg uuid "$uuid" \
+       --arg prikey "$private_key" \
+       --arg sid "$short_id" \
+       --arg server "$server_name" \
+       --arg fp "$fp" \
+       --arg flow "$flow" \
+       --arg tag "$tag" \
        '.inbounds += [{
          "type": "vless",
          "tag": $tag,
@@ -1218,51 +1271,52 @@ ensure_runtime_deps
     fi
 
     local tmpmeta; tmpmeta=$(mktemp)
-    jq --arg tag "$TAG" --arg pbk "$PUBLIC_KEY" --arg sid "$SHORT_ID" --arg sni "$SERVER_NAME" --arg port "$PORT" --arg fp "$FP" \
+    trap 'rm -f "$tmpmeta"' EXIT
+    jq --arg tag "$tag" --arg pbk "$public_key" --arg sid "$short_id" --arg sni "$server_name" --arg port "$port" --arg fp "$fp" \
       '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni, port:$port, fp:$fp}}' "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
 
-    local IPV4; IPV4=$(curl -s --max-time 2 https://api.ipify.org)
     say ""; ok "添加成功：VLESS Reality"
-    say "端口: $PORT"
-    say "UUID: $UUID"
-    say "Public Key: $PUBLIC_KEY"
-    say "Short ID: $SHORT_ID"
-    say "SNI: $SERVER_NAME"
-    say "Fingerprint: $FP"
-    say "TAG: $TAG"
+    say "端口: $port"
+    say "UUID: $uuid"
+    say "Public Key: $public_key"
+    say "Short ID: $short_id"
+    say "SNI: $server_name"
+    say "Fingerprint: $fp"
+    say "TAG: $tag"
     say ""
     say " 客户端链接："
-    say "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=${FLOW}&type=tcp&security=reality&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
+    say "vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=${flow}&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=${fp}#${tag}"
     say ""
     return
   else
     # SOCKS5 (TCP 语义端口)
-    local PORT USER PASS TAG tmpcfg proto="tcp" mode
+    local port user pass tag tmpcfg proto_type="tcp"
     while true; do
-      if [[ -f "$NAT_FILE" ]]; then
-        mode=$(jq -r '.mode' "$NAT_FILE")
-        [[ "$mode" == "custom" ]] && say "已启用自定义端口模式：SOCKS5 仅允许使用 自定义TCP端口 集合"
-        [[ "$mode" == "range"  ]] && say "已启用范围端口模式：SOCKS5 仅允许使用 范围内端口"
+      if [[ -n "$nat_mode" ]]; then
+        [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：SOCKS5 仅允许使用 自定义TCP端口 集合"
+        [[ "$nat_mode" == "range"  ]] && say "已启用范围端口模式：SOCKS5 仅允许使用 范围内端口"
       fi
-      read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " PORT
-      if [[ -z "$PORT" ]]; then
-        PORT=$(get_random_allowed_port "$proto")
-        [[ "$PORT" == "NO_PORT" ]] && { err "无可用端口"; return 1; }
-        say "（已自动选择随机端口：$PORT）"
+      read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " port
+      if [[ -z "$port" ]]; then
+        port=$(get_random_allowed_port "$proto_type")
+        [[ "$port" == "NO_PORT" ]] && { err "无可用端口"; return 1; }
+        say "（已自动选择随机端口：$port）"
       fi
-      [[ "$PORT" == "0" ]] && return
-      [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT>=1 && PORT<=65535)) || { warn "端口无效"; continue; }
-      if ! check_nat_allow "$PORT" "$proto"; then warn "端口 $PORT 不符合 NAT 规则（协议: $proto）"; continue; fi
-      if jq -e --argjson p "$PORT" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then warn "端口 $PORT 已存在"; continue; fi
-      if jq -e --argjson p "$PORT" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then warn "端口 $PORT 已被 Hysteria2 使用"; continue; fi
+      [[ "$port" == "0" ]] && return
+      [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || { warn "端口无效"; continue; }
+      (( port < 1024 )) && warn "端口<1024可能需root权限"
+      if ! check_nat_allow "$port" "$proto_type"; then warn "端口 $port 不符合 NAT 规则（协议: $proto_type）"; continue; fi
+      if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then warn "端口 $port 已存在"; continue; fi
+      if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then warn "端口 $port 已被 Hysteria2 使用"; continue; fi
       break
     done
-    read -rp "请输入用户名（默认 user）: " USER; USER=${USER:-user}
-    read -rp "请输入密码（默认 pass123）: " PASS; PASS=${PASS:-pass123}
-    TAG="sk5-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
+    read -rp "请输入用户名（默认 user）: " user; user=${user:-user}
+    read -rp "请输入密码（默认 pass123）: " pass; pass=${pass:-pass123}
+    tag="sk5-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
 
     tmpcfg=$(mktemp)
-    jq --arg port "$PORT" --arg user "$USER" --arg pass "$PASS" --arg tag "$TAG" \
+    trap 'rm -f "$tmpcfg"' EXIT
+    jq --arg port "$port" --arg user "$user" --arg pass "$pass" --arg tag "$tag" \
       '.inbounds += [{"type":"socks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"users":[{"username":$user,"password":$pass}]}]' \
       "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
 
@@ -1275,49 +1329,43 @@ ensure_runtime_deps
     fi
 
     say ""; ok "添加成功：SOCKS5"
-    say "端口: $PORT"
-    say "用户名: $USER"
-    say "密码: $PASS"
-    say "TAG: $TAG"
+    say "端口: $port"
+    say "用户名: $user"
+    say "密码: $pass"
+    say "TAG: $tag"
     say ""
     say " 客户端链接："
-    local IPV4; IPV4=$(curl -s --max-time 2 https://api.ipify.org)
-    local IPV6; IPV6=$(get_ipv6_address)
-    if [[ -n "$IPV4" ]]; then
-      local CREDS; CREDS=$(printf "%s" "$USER:$PASS" | base64)
-      say "IPv4: socks://${CREDS}@${IPV4}:${PORT}#${TAG}"
-      [[ -n "$IPV6" ]] && say "IPv6: socks://${CREDS}@[${IPV6}]:${PORT}#${TAG}"
-    else
-      say "请使用 domain/IP 和端口连接 SOCKS5 节点 (用户名: $USER, 密码: $PASS)"
-    fi
+    local creds; creds=$(printf "%s" "$user:$pass" | base64)
+    say "IPv4: socks://${creds}@${GLOBAL_IPV4}:${port}#${tag}"
+    [[ -n "$GLOBAL_IPV6" ]] && say "IPv6: socks://${creds}@[${GLOBAL_IPV6}]:${port}#${tag}"
     say ""
   fi
 }
 
 add_hysteria2_node() {
-  local PORT proto="udp" mode
+  local port proto_type="udp"
   ensure_runtime_deps
   while true; do
-    if [[ -f "$NAT_FILE" ]]; then
-      mode=$(jq -r '.mode' "$NAT_FILE")
-      [[ "$mode" == "custom" ]] && say "已启用自定义端口模式：Hysteria2 仅允许使用 自定义UDP端口 集合"
-      [[ "$mode" == "range"  ]] && say "已启用范围端口模式：Hysteria2 仅允许使用 范围内端口"
+    if [[ -n "$nat_mode" ]]; then
+      [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：Hysteria2 仅允许使用 自定义UDP端口 集合"
+      [[ "$nat_mode" == "range"  ]] && say "已启用范围端口模式：Hysteria2 仅允许使用 范围内端口"
     fi
-    read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " PORT
-    if [[ -z "$PORT" ]]; then
-      PORT=$(get_random_allowed_port "$proto")
-      [[ "$PORT" == "NO_PORT" ]] && { err "无可用端口"; return 1; }
-      say "（已自动选择随机端口：$PORT）"
+    read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " port
+    if [[ -z "$port" ]]; then
+      port=$(get_random_allowed_port "$proto_type")
+      [[ "$port" == "NO_PORT" ]] && { err "无可用端口"; return 1; }
+      say "（已自动选择随机端口：$port）"
     fi
-    [[ "$PORT" == "0" ]] && return
-    [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT>=1 && PORT<=65535)) || { warn "端口无效"; continue; }
-    if ! check_nat_allow "$PORT" "$proto"; then warn "端口 $PORT 不符合 NAT 规则（协议: $proto）"; continue; fi
-    if jq -e --argjson p "$PORT" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then warn "端口 $PORT 已被 sing-box 使用"; continue; fi
-    if jq -e --argjson p "$PORT" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then warn "端口 $PORT 已存在"; continue; fi
+    [[ "$port" == "0" ]] && return
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || { warn "端口无效"; continue; }
+    (( port < 1024 )) && warn "端口<1024可能需root权限"
+    if ! check_nat_allow "$port" "$proto_type"; then warn "端口 $port 不符合 NAT 规则（协议: $proto_type）"; continue; fi
+    if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then warn "端口 $port 已被 sing-box 使用"; continue; fi
+    if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then warn "端口 $port 已存在"; continue; fi
     break
   done
 
-  local DOMAIN="bing.com"
+  local domain="bing.com"
 
   if ! command -v hysteria >/dev/null 2>&1; then
     warn "未检测到 hysteria，正在安装..."
@@ -1329,61 +1377,58 @@ add_hysteria2_node() {
       *) err "暂不支持的架构：$arch"; return 1 ;;
     esac
     local tmp; tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
     (
       set -e
       cd "$tmp"
       curl -sSL "https://github.com/apernet/hysteria/releases/download/app/v${H_VERSION}/hysteria-linux-${arch}" -o hysteria-bin || { err "下载 hysteria 失败"; exit 1; }
       install -m 0755 hysteria-bin /usr/local/bin/hysteria
-    ) || { rm -rf "$tmp"; return 1; }
-    rm -rf "$tmp"
+    ) || { return 1; }
     ok "hysteria 安装完成"
   fi
 
   mkdir -p /etc/hysteria2
 
-  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria2/${PORT}.key 2>/dev/null || \
-    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out /etc/hysteria2/${PORT}.key 2>/dev/null
-  openssl req -new -x509 -nodes -key /etc/hysteria2/${PORT}.key -out /etc/hysteria2/${PORT}.crt -subj "/CN=${DOMAIN}" -days 36500 >/dev/null 2>&1 || {
-    err "自签证书生成失败"; return 1; }
+  generate_self_signed_cert "/etc/hysteria2/${port}.key" "/etc/hysteria2/${port}.crt" "$domain" || { err "自签证书生成失败"; return 1; }
 
-  local AUTH_PWD OBFS_PWD
-  AUTH_PWD=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
-  OBFS_PWD=$(openssl rand -base64 8 | tr -d '=+/' | cut -c1-8)
+  local auth_pwd obfs_pwd
+  auth_pwd=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
+  obfs_pwd=$(openssl rand -base64 8 | tr -d '=+/' | cut -c1-8)
 
-  local TAG="hysteria2-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
-  if jq -e --arg t "$TAG" '.inbounds[] | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1 || jq -e --arg t "$TAG" 'has($t)' "$META" >/dev/null 2>&1; then
-    TAG="hysteria2-$(get_country_code)-$(date +%s)"
+  local tag="hysteria2-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
+  if jq -e --arg t "$tag" '.inbounds[] | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1 || jq -e --arg t "$tag" 'has($t)' "$META" >/dev/null 2>&1; then
+    tag="hysteria2-$(get_country_code)-$(date +%s)"
   fi
 
-  cat > /etc/hysteria2/${PORT}.yaml <<EOF
-listen: ":${PORT}"
+  cat > /etc/hysteria2/${port}.yaml <<EOF
+listen: ":${port}"
 tls:
-  cert: /etc/hysteria2/${PORT}.crt
-  key: /etc/hysteria2/${PORT}.key
+  cert: /etc/hysteria2/${port}.crt
+  key: /etc/hysteria2/${port}.key
 obfs:
   type: salamander
   salamander:
-    password: ${OBFS_PWD}
+    password: ${obfs_pwd}
 auth:
   type: password
-  password: ${AUTH_PWD}
+  password: ${auth_pwd}
 masquerade:
   type: proxy
   proxy:
-    url: https://${DOMAIN}
+    url: https://${domain}
     rewriteHost: true
     insecure: true
 EOF
 
-  cat > /etc/systemd/system/hysteria2-${PORT}.service <<EOF
+  cat > /etc/systemd/system/hysteria2-${port}.service <<EOF
 [Unit]
-Description=Hysteria2 Service (${PORT})
+Description=Hysteria2 Service (${port})
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria2/${PORT}.yaml
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria2/${port}.yaml
 Restart=always
 RestartSec=3s
 LimitNOFILE=1048576
@@ -1392,115 +1437,137 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload >/dev/null 2>&1
-  systemctl enable hysteria2-${PORT}.service >/dev/null 2>&1 || true
-  systemctl restart hysteria2-${PORT}.service >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || log_msg "WARN" "daemon-reload failed"
+  systemctl enable hysteria2-${port}.service >/dev/null 2>&1 || log_msg "WARN" "enable hysteria2-${port} failed"
+  systemctl restart hysteria2-${port}.service >/dev/null 2>&1 || log_msg "WARN" "restart hysteria2-${port} failed"
 
   sleep 1
-  if systemctl is-active --quiet hysteria2-${PORT}; then ok "Hysteria2 服务已启动"
-  else err "Hysteria2 服务启动失败，请检查日志 (journalctl -u hysteria2-${PORT})"; return 1; fi
+  if systemctl is-active --quiet hysteria2-${port}; then ok "Hysteria2 服务已启动"
+  else err "Hysteria2 服务启动失败，请检查日志 (journalctl -u hysteria2-${port})"; return 1; fi
 
   local tmpmeta; tmpmeta=$(mktemp)
-  jq --arg tag "$TAG" --arg port "$PORT" --arg sni "$DOMAIN" --arg obfs "$OBFS_PWD" --arg auth "$AUTH_PWD" \
+  trap 'rm -f "$tmpmeta"' EXIT
+  jq --arg tag "$tag" --arg port "$port" --arg sni "$domain" --arg obfs "$obfs_pwd" --arg auth "$auth_pwd" \
     '. + {($tag): {type:"hysteria2", port:$port, sni:$sni, obfs:$obfs, auth:$auth}}' "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
 
-  local IPV4 IPV6
-  IPV4=$(curl -s --max-time 2 https://api.ipify.org || echo "")
-  [[ -z "$IPV4" ]] && IPV4="<服务器IP>"
-  IPV6=$(get_ipv6_address)
   say ""; ok "添加成功：Hysteria2"
-  say "端口: $PORT"
-  say "Auth密码: $AUTH_PWD"
-  say "Obfs密码: $OBFS_PWD"
-  say "SNI域名: $DOMAIN"
-  say "TAG: $TAG"
+  say "端口: $port"
+  say "Auth密码: $auth_pwd"
+  say "Obfs密码: $obfs_pwd"
+  say "SNI域名: $domain"
+  say "TAG: $tag"
   say ""
   say " 客户端链接："
-  [[ -n "$IPV4" ]] && say "hysteria2://${AUTH_PWD}@${IPV4}:${PORT}?obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
-  [[ -n "$IPV6" ]] && say "hysteria2://${AUTH_PWD}@[${IPV6}]:${PORT}?obfs=salamander&obfs-password=${OBFS_PWD}&sni=${DOMAIN}&insecure=1#${TAG}"
+  [[ -n "$GLOBAL_IPV4" ]] && say "hysteria2://${auth_pwd}@${GLOBAL_IPV4}:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${domain}&insecure=1#${tag}"
+  [[ -n "$GLOBAL_IPV6" ]] && say "hysteria2://${auth_pwd}@[${GLOBAL_IPV6}]:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${domain}&insecure=1#${tag}"
   say ""
 }
 
 view_nodes() {
   set +e
-  local IPV4; IPV4=$(curl -s --max-time 2 https://api.ipify.org || echo "")
-  [[ -z "$IPV4" ]] && IPV4="<服务器IP>"
-  local IPV6; IPV6=$(get_ipv6_address)
-
   local total ext_count
   total=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo "0")
   ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null || echo "0")
   if [[ ( -z "$total" || "$total" == "0" ) && ( -z "$ext_count" || "$ext_count" == "0" ) ]]; then say "暂无节点"; set -e; return; fi
 
-  local idx=0 json
-  while IFS= read -r json; do
+  declare -A node_ports node_types node_tags node_uuids node_users node_passes node_pbks node_sids node_snis node_fps
+  local idx=0
+  while read -r line; do
+    local tag port type uuid user pass
+    tag=$(jq -r '.tag' <<<"$line")
+    port=$(jq -r '.listen_port' <<<"$line")
+    type=$(jq -r '.type' <<<"$line")
+    uuid=$(jq -r '.users[0].uuid // empty' <<<"$line")
+    user=$(jq -r '.users[0].username // empty' <<<"$line")
+    pass=$(jq -r '.users[0].password // empty' <<<"$line")
+    node_tags[$idx]="$tag"
+    node_ports[$idx]="$port"
+    node_types[$idx]="$type"
+    node_uuids[$idx]="$uuid"
+    node_users[$idx]="$user"
+    node_passes[$idx]="$pass"
+    node_pbks[$idx]=$(jq -r --arg t "$tag" '.[$t].pbk // empty' "$META")
+    node_sids[$idx]=$(jq -r --arg t "$tag" '.[$t].sid // empty' "$META")
+    node_snis[$idx]=$(jq -r --arg t "$tag" '.[$t].sni // empty' "$META")
+    node_fps[$idx]=$(jq -r --arg t "$tag" '.[$t].fp // "chrome"' "$META")
     idx=$((idx+1))
-    local PORT TAG TYPE
-    PORT=$(jq -r '.listen_port' <<<"$json")
-    TAG=$(jq -r '.tag' <<<"$json")
-    TYPE=$(jq -r '.type' <<<"$json")
-    say "[$idx] 端口: $PORT | 协议: $TYPE | 名称: $TAG"
-    port_status "$PORT"; case $? in 1) warn "端口 $PORT 被其他进程占用";; 2) warn "端口 $PORT 未监听";; esac
-
-    if [[ "$TYPE" == "vless" ]]; then
-      local UUID PBK SID SERVER_NAME FP
-      UUID=$(jq -r '.users[0].uuid' <<<"$json")
-      PBK=$(jq -r --arg tag "$TAG" '.[$tag].pbk // empty' "$META" 2>/dev/null)
-      SID=$(jq -r --arg tag "$TAG" '.[$tag].sid // empty' "$META" 2>/dev/null)
-      SERVER_NAME=$(jq -r --arg tag "$TAG" '.[$tag].sni // empty' "$META" 2>/dev/null)
-      FP=$(jq -r --arg tag "$TAG" '.[$tag].fp // "chrome"' "$META" 2>/dev/null)
-      [[ -z "$SERVER_NAME" || "$SERVER_NAME" == "null" ]] && SERVER_NAME=$(jq -r '.tls.reality.handshake.server // .tls.server_name // empty' <<<"$json")
-      [[ -z "$SID" || "$SID" == "null" ]] && SID=$(jq -r '.tls.reality.short_id[0] // empty' <<<"$json")
-      if [[ -n "$PBK" && -n "$SID" && -n "$SERVER_NAME" ]]; then
-        say "vless://${UUID}@${IPV4}:${PORT}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${PBK}&sid=${SID}&sni=${SERVER_NAME}&fp=${FP}#${TAG}"
-      else
-        warn "节点参数不完整，无法生成链接"
-      fi
-    elif [[ "$TYPE" == "socks" ]]; then
-      local USER PASS ENCODED
-      USER=$(jq -r '.users[0].username' <<<"$json")
-      PASS=$(jq -r '.users[0].password' <<<"$json")
-      ENCODED=$(printf "%s" "$USER:$PASS" | base64)
-      say "IPv4: socks://${ENCODED}@${IPV4}:${PORT}#${TAG}"
-      [[ -n "$IPV6" ]] && say "IPv6: socks://${ENCODED}@[${IPV6}]:${PORT}#${TAG}"
-    fi
-    say "---------------------------------------------------"
   done < <(jq -c '.inbounds[]' "$CONFIG" 2>/dev/null)
 
-  if [[ -n "$ext_count" && "$ext_count" != "0" ]]; then
-    for key in $(jq -r 'to_entries[] | select(.value.type=="hysteria2") | .key' "$META"); do
+  if [[ $ext_count -gt 0 ]]; then
+    while read -r line; do
+      local tag port auth obfs sni
+      tag=$(jq -r '.key' <<<"$line")
+      port=$(jq -r '.value.port // empty' <<<"$line")
+      auth=$(jq -r '.value.auth // empty' <<<"$line")
+      obfs=$(jq -r '.value.obfs // empty' <<<"$line")
+      sni=$(jq -r '.value.sni // empty' <<<"$line")
+      node_tags[$idx]="$tag"
+      node_ports[$idx]="$port"
+      node_types[$idx]="hysteria2"
+      node_uuids[$idx]=""
+      node_users[$idx]=""
+      node_passes[$idx]="$auth"
+      node_pbks[$idx]=""
+      node_sids[$idx]=""
+      node_snis[$idx]="$sni"
+      node_fps[$idx]=""
+      node_obfs[$idx]="$obfs"
       idx=$((idx+1))
-      local PORT TAG AUTH OBFS SNI
-      TAG="$key"
-      PORT=$(jq -r --arg t "$TAG" '.[$t].port // empty' "$META")
-      say "[$idx] 端口: $PORT | 协议: hysteria2 | 名称: $TAG"
-      AUTH=$(jq -r --arg t "$TAG" '.[$t].auth // empty' "$META")
-      OBFS=$(jq -r --arg t "$TAG" '.[$t].obfs // empty' "$META")
-      SNI=$(jq -r --arg t "$TAG" '.[$t].sni // empty' "$META")
-      if [[ -n "$AUTH" && -n "$OBFS" && -n "$SNI" ]]; then
-        say "hysteria2://${AUTH}@${IPV4}:${PORT}?obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
-        [[ -n "$IPV6" ]] && say "hysteria2://${AUTH}@[${IPV6}]:${PORT}?obfs=salamander&obfs-password=${OBFS}&sni=${SNI}&insecure=1#${TAG}"
+    done < <(jq -c 'to_entries[] | select(.value.type=="hysteria2")' "$META" 2>/dev/null)
+  fi
+
+  local ss_tcp=$(ss -ltnp 2>/dev/null || true)
+  local ss_udp=$(ss -lunp 2>/dev/null || true)
+
+  idx=0
+  while (( idx < total + ext_count )); do
+    local port="${node_ports[$idx]}" tag="${node_tags[$idx]}" type="${node_types[$idx]}"
+    say "[$((idx+1))] 端口: $port | 协议: $type | 名称: $tag"
+    if grep -q ":$port " <<<"$ss_tcp" || grep -q ":$port " <<<"$ss_udp"; then
+      : # OK
+    else
+      warn "端口 $port 未监听"
+    fi
+    if [[ "$type" == "vless" ]]; then
+      local uuid="${node_uuids[$idx]}" pbk="${node_pbks[$idx]}" sid="${node_sids[$idx]}" sni="${node_snis[$idx]}" fp="${node_fps[$idx]}"
+      if [[ -n "$pbk" && -n "$sid" && -n "$sni" ]]; then
+        say "vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=${fp}#${tag}"
       else
         warn "节点参数不完整，无法生成链接"
       fi
-      say "---------------------------------------------------"
-    done
-  fi
+    elif [[ "$type" == "socks" ]]; then
+      local user="${node_users[$idx]}" pass="${node_passes[$idx]}" encoded
+      encoded=$(printf "%s" "$user:$pass" | base64)
+      say "IPv4: socks://${encoded}@${GLOBAL_IPV4}:${port}#${tag}"
+      [[ -n "$GLOBAL_IPV6" ]] && say "IPv6: socks://${encoded}@[${GLOBAL_IPV6}]:${port}#${tag}"
+    elif [[ "$type" == "hysteria2" ]]; then
+      local auth="${node_passes[$idx]}" obfs="${node_obfs[$idx]}" sni="${node_snis[$idx]}"
+      if [[ -n "$auth" && -n "$obfs" && -n "$sni" ]]; then
+        say "hysteria2://${auth}@${GLOBAL_IPV4}:${port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${tag}"
+        [[ -n "$GLOBAL_IPV6" ]] && say "hysteria2://${auth}@[${GLOBAL_IPV6}]:${port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${tag}"
+      else
+        warn "节点参数不完整，无法生成链接"
+      fi
+    fi
+    say "---------------------------------------------------"
+    idx=$((idx+1))
+  done
   set -e
 }
 
 delete_node() {
-  local COUNT; COUNT=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null)
+  local count; count=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null)
   local ext_count; ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null)
-  if [[ ( -z "$COUNT" || "$COUNT" == "0" ) && ( -z "$ext_count" || "$ext_count" == "0" ) ]]; then say "暂无节点"; return; fi
+  if [[ ( -z "$count" || "$count" == "0" ) && ( -z "$ext_count" || "$ext_count" == "0" ) ]]; then say "暂无节点"; return; fi
   view_nodes
   say "[0] 返回主菜单"
   say "[ss] 删除所有节点"
-  read -rp "请输入要删除的节点序号： " IDX
-  [[ "$IDX" == "0" || -z "$IDX" ]] && return
-  if [[ "$IDX" == "ss" ]]; then
+  read -rp "请输入要删除的节点序号： " idx
+  [[ "$idx" == "0" || -z "$idx" ]] && return
+  if [[ "$idx" == "ss" ]]; then
     read -rp " 确认删除全部节点？(y/N): " c; [[ "$c" == "y" ]] || { say "已取消"; return; }
     local tmpcfg; tmpcfg=$(mktemp)
+    trap 'rm -f "$tmpcfg"' EXIT
     jq '.inbounds = []' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
     printf '{}' >"$META"
     shopt -s nullglob
@@ -1510,39 +1577,42 @@ delete_node() {
       rm -f "$f"
     done
     shopt -u nullglob
-    systemctl daemon-reload || true
+    systemctl daemon-reload || log_msg "WARN" "daemon-reload failed"
     rm -rf /etc/hysteria2
     ok "所有节点已删除"; return
   fi
-  if ! [[ "$IDX" =~ ^[0-9]+$ ]]; then warn "无效输入"; return; fi
-  local idx0=$((IDX-1))
-  if (( idx0 < 0 || idx0 >= (COUNT + ext_count) )); then warn "序号越界"; return; fi
+  if ! [[ "$idx" =~ ^[0-9]+$ ]]; then warn "无效输入"; return; fi
+  local idx0=$((idx-1))
+  if (( idx0 < 0 || idx0 >= (count + ext_count) )); then warn "序号越界"; return; fi
 
-  if (( idx0 >= COUNT )); then
-    local ext_index=$((idx0 - COUNT))
+  if (( idx0 >= count )); then
+    local ext_index=$((idx0 - count))
     local tag_to_delete; tag_to_delete=$(jq -r --argjson i "$ext_index" 'to_entries | map(select(.value.type=="hysteria2")) | .[$i].key // empty' "$META")
     if [[ -n "$tag_to_delete" && "$tag_to_delete" != "null" ]]; then
       local port_del; port_del=$(jq -r --arg t "$tag_to_delete" '.[$t].port // empty' "$META")
       local tmpmeta; tmpmeta=$(mktemp)
+      trap 'rm -f "$tmpmeta"' EXIT
       jq "del(.\"$tag_to_delete\")" "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
       if [[ -f "/etc/systemd/system/hysteria2-${port_del}.service" ]]; then
         systemctl disable --now "hysteria2-${port_del}" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/hysteria2-${port_del}.service"
       fi
-      systemctl daemon-reload || true
+      systemctl daemon-reload || log_msg "WARN" "daemon-reload failed"
       [[ -n "$port_del" ]] && rm -f "/etc/hysteria2/${port_del}.yaml" "/etc/hysteria2/${port_del}.key" "/etc/hysteria2/${port_del}.crt"
-      ok "已删除节点 [$IDX]"
+      ok "已删除节点 [$idx]"
       return
     fi
   fi
-  local tag; tag=$(jq -r ".inbounds[$((idx0))].tag // empty" "$CONFIG")
+  local tag; tag=$(jq -r ".inbounds[$idx0].tag // empty" "$CONFIG")
   local tmpcfg; tmpcfg=$(mktemp)
-  jq "del(.inbounds[$((idx0))])" "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
+  trap 'rm -f "$tmpcfg"' EXIT
+  jq "del(.inbounds[$idx0])" "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
   if [[ -n "$tag" && "$tag" != "null" ]]; then
     local tmpmeta; tmpmeta=$(mktemp)
+    trap 'rm -f "$tmpmeta"' EXIT
     jq "del(.\"$tag\")" "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
   fi
-  ok "已删除节点 [$IDX]"
+  ok "已删除节点 [$idx]"
 }
 
 is_docker() {
@@ -1615,13 +1685,13 @@ script_services_menu() {
     say "0) 返回主菜单"
     read -rp "请选择: " op
     case "$op" in
-      1) ( check_and_repair_menu ) || true ;;   # 在子shell中运行，即使出错也不会退出整个脚本
-      2) ( restart_singbox ) || true ;;
-      3) ( update_singbox ) || true ;;
-      4) ( reinstall_menu ) || true ;;
+      1) check_and_repair_menu ;;
+      2) restart_singbox ;;
+      3) update_singbox ;;
+      4) reinstall_menu ;;
       0) break ;;
       *) warn "无效输入" ;;
-    esac
+  esac
   done
 }
 
@@ -1637,8 +1707,8 @@ main_menu() {
   say "5) NAT 模式设置"
   say "0) 退出"
   say "==============================================================="
-  read -rp "请输入操作编号: " CHOICE
-  case "$CHOICE" in
+  read -rp "请输入操作编号: " choice
+  case "$choice" in
     1) add_node ;;
     2) view_nodes ;;
     3) delete_node ;;
@@ -1679,6 +1749,11 @@ case "$INIT_SYS" in
     start_singbox_legacy_nohup
     ;;
 esac
+
+GLOBAL_IPV4=$(curl -s --max-time 2 https://api.ipify.org || echo "<服务器IP>")
+GLOBAL_IPV6=$(get_ipv6_address)
+
+load_nat_data
 
 trap on_int_menu_quit_only INT
 while true; do main_menu; done
