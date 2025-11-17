@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 export LANG=en_US.UTF-8
 [ -z "${vlpt+x}" ] || vlp=yes
 [ -z "${vmpt+x}" ] || { vmp=yes; vmag=yes; } 
@@ -43,7 +43,9 @@ showmode(){
 echo "---------------------------------------------------------"
 echo
 }
-
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+echo "Argosbx一键无交互脚本"
+echo "当前版本：V25.10.5"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -96,7 +98,7 @@ esac
 fi
 fi
 case "$warp" in *x4*) wxryx='ForceIPv4' ;; *x6*) wxryx='ForceIPv6' ;; *) wxryx='ForceIPv4v6' ;; esac
-if (command -v curl >/dev/null 2>&1 && curl -s6m5 -k "$v46url" >/dev/null 2>&1) || (command -v wget >/dev/null 2>&1 && timeout 3 wget -6 --tries=2 -qO- "$v46url" >/dev/null 2>&1); then
+if { command -v curl >/dev/null 2>&1 && curl -s6m5 -k "$v46url" >/dev/null 2>&1; } || { command -v wget >/dev/null 2>&1 && timeout 3 wget -6 --tries=2 -qO- "$v46url" >/dev/null 2>&1; }; then
 xryx='ForceIPv6v4'; sbyx='prefer_ipv6'
 else
 case "$warp" in *x4*) xryx='ForceIPv4' ;; esac
@@ -1252,10 +1254,10 @@ echo "Vmess主协议端口(Argo隧道端口)：$port_vm_ws
 当前Argo域名：$argodomain
 $nametn
 
-1、443端口的vmess-ws-tls-argo节点(优选IP与443系端口随便换)
+1、💣443端口的vmess-ws-tls-argo节点(优选IP与443系端口随便换)
 $vmatls_link1
 
-2、80端口的vmess-ws-argo节点(优选IP与80系端口随便换)
+2、💣80端口的vmess-ws-argo节点(优选IP与80系端口随便换)
 $vma_link7
 "
 )
@@ -1263,6 +1265,8 @@ fi
 echo
 echo "---------------------------------------------------------"
 echo "$argoshow"
+echo "---------------------------------------------------------"
+echo "聚合节点信息，请进入 $HOME/agsbx/jh.txt 文件目录查看或者运行 cat $HOME/agsbx/jh.txt 查看"
 echo "========================================================="
 showmode
 }
@@ -1297,7 +1301,7 @@ if [ "$1" = "del" ]; then
 cleandel
 rm -rf "$HOME/agsbx" "$HOME/agsb"
 echo "卸载完成"
-echo "欢迎继续使用" && sleep 2
+echo "欢迎继续使用甬哥侃侃侃ygkkk的Argosbx一键无交互小钢炮脚本💣" && sleep 2
 echo
 showmode
 exit
