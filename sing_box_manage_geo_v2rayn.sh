@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # === Ctrl+C 安全处理 & 守护启动工具 ===
 # === Ctrl+C 安全处理（只退菜单，不清理/不杀服务） ===
-
+# ===== 1. 在脚本最上方（其他全局变量附近）新增 =====
+ARGO_CACHE="/root/agsbx/jh.txt"          # Argo 脚本生成的节点文件
+ARGO_META_TAG_PREFIX="argo-tunnel-"      # 为了避免 tag 冲突
 on_int_menu_quit_only() {
   restart_singbox >/dev/null 2>&1  # 静默重启 sing-box
   trap - EXIT  # 清空 EXIT trap
@@ -1290,14 +1292,54 @@ add_node() {
     say "vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=${flow}&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=${fp}#${tag}"
     say ""
     return
-  elif [[ "$proto" == "4" ]]; then
-    # Argo 临时隧道配置逻辑
-
-    say "正在执行 Argo 临时隧道配置..."
-    vmpt="" argo="y" bash <(curl -Ls https://raw.githubusercontent.com/chinahch/sk5/refs/heads/main/CF.sh)
-    say "Argo 临时隧道配置完成"
+# ===== 2. 把原来的 Argo 分支（在 add_node() 函数内）替换成下面这段 =====
+elif [[ "$proto" == "4" ]]; then
+    # ============ 新增 Argo 临时隧道子菜单 ============
+    while true; do
+      say "========== Argo 临时隧道 =========="
+      say "1) 安装并运行 Argo 临时隧道"
+      say "2) 卸载 Argo 临时隧道"
+      say "0) 返回上级菜单"
+      read -rp "请选择: " argo_choice
+      case "$argo_choice" in
+        1)
+          say "正在安装并运行 Argo 临时隧道..."
+          vmpt="" argo="y" bash <(curl -Ls https://raw.githubusercontent.com/chinahch/sk5/refs/heads/main/CF.sh)
+          
+          # 执行完后自动导入生成的节点文件
+          if [[ -f "$ARGO_CACHE" ]]; then
+              if import_argo_nodes; then
+                  ok "Argo 临时隧道已启动并成功导入 $(wc -l < "$ARGO_CACHE" 2>/dev/null || echo 0) 个节点"
+              else
+                  warn "Argo 隧道运行中，但节点导入失败（文件不存在或格式错误）"
+              fi
+          else
+              warn "Argo 隧道脚本执行完成，但未生成节点文件 $ARGO_CACHE"
+          fi
+          break
+          ;;
+        2)
+          say " ---正在卸载---"
+          bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/argosbx/main/argosbx.sh) del >/dev/null 2>&1
+          # 清理本脚本缓存的 Argo 节点（不影响本地 VLESS/SOCKS/Hy2 节点）
+          if [[ -f "$ARGO_CACHE" ]]; then
+              rm -f "$ARGO_CACHE"
+              ok "Argo 临时隧道已卸载，节点缓存文件已删除"
+          else
+              ok "---卸载完成---"
+          fi
+          # 清除 META 中所有 argo 类型的节点记录
+          jq 'to_entries | map(select(.value.type != "argo")) | from_entries' "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
+          restart_singbox >/dev/null 2>&1 || true
+          break
+          ;;
+        0)
+          return
+          ;;
+        *) warn "无效选项，请重新选择" ;;
+      esac
+    done
     return
-  else
     # SOCKS5 (TCP 语义端口)
     local port user pass tag tmpcfg proto_type="tcp"
     while true; do
@@ -1471,16 +1513,42 @@ EOF
   [[ -n "$GLOBAL_IPV6" ]] && say "hysteria2://${auth_pwd}@[${GLOBAL_IPV6}]:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${domain}&insecure=1#${tag}"
   say ""
 }
-
+# ===== 3. 在脚本任意位置（建议放在 add_hysteria2_node 之后）新增这个完整函数 =====
+import_argo_nodes() {
+    [[ ! -f "$ARGO_CACHE" ]] && return 1
+    
+    local line tag idx=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        
+        # 支持常见的几种格式（vmess://  vless://  trojan://  ss://）
+        if [[ "$line" =~ ^(vmess|vless|trojan|ss):// ]]; then
+            # 生成唯一 tag
+            tag="${ARGO_META_TAG_PREFIX}$(date +%s)-$((idx++))"
+            
+            # 把原始链接原样保存到 META，方便后面显示
+            jq --arg t "$tag" --arg url "$line" \
+               '.[$t] = {type:"argo", raw:$url}' "$META" > "$META.tmp" && mv "$META.tmp" "$META"
+        fi
+    done < "$ARGO_CACHE"
+    
+    # 完成后尝试重启 sing-box（Argo 本身不需要，但保持统一体验）
+    restart_singbox >/dev/null 2>&1 || true
+    return 0
+}
 view_nodes() {
   set +e
-  local total ext_count
+
+  local total ext_count argo_count=0
   total=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo "0")
   ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null || echo "0")
-  if [[ ( -z "$total" || "$total" == "0" ) && ( -z "$ext_count" || "$ext_count" == "0" ) ]]; then say "暂无节点"; set -e; return; fi
 
-  declare -A node_ports node_types node_tags node_uuids node_users node_passes node_pbks node_sids node_snis node_fps
+  declare -A node_ports node_types node_tags node_uuids node_users node_passes \
+              node_pbks node_sids node_snis node_fps node_obfs node_raws
+
   local idx=0
+
+  # sing-box 本地节点
   while read -r line; do
     local tag port type uuid user pass
     tag=$(jq -r '.tag' <<<"$line")
@@ -1489,6 +1557,7 @@ view_nodes() {
     uuid=$(jq -r '.users[0].uuid // empty' <<<"$line")
     user=$(jq -r '.users[0].username // empty' <<<"$line")
     pass=$(jq -r '.users[0].password // empty' <<<"$line")
+
     node_tags[$idx]="$tag"
     node_ports[$idx]="$port"
     node_types[$idx]="$type"
@@ -1499,10 +1568,11 @@ view_nodes() {
     node_sids[$idx]=$(jq -r --arg t "$tag" '.[$t].sid // empty' "$META")
     node_snis[$idx]=$(jq -r --arg t "$tag" '.[$t].sni // empty' "$META")
     node_fps[$idx]=$(jq -r --arg t "$tag" '.[$t].fp // "chrome"' "$META")
-    idx=$((idx+1))
+    ((idx++))
   done < <(jq -c '.inbounds[]' "$CONFIG" 2>/dev/null)
 
-  if [[ $ext_count -gt 0 ]]; then
+  # Hysteria2 节点
+  if (( ext_count > 0 )); then
     while read -r line; do
       local tag port auth obfs sni
       tag=$(jq -r '.key' <<<"$line")
@@ -1510,120 +1580,133 @@ view_nodes() {
       auth=$(jq -r '.value.auth // empty' <<<"$line")
       obfs=$(jq -r '.value.obfs // empty' <<<"$line")
       sni=$(jq -r '.value.sni // empty' <<<"$line")
+
       node_tags[$idx]="$tag"
       node_ports[$idx]="$port"
       node_types[$idx]="hysteria2"
-      node_uuids[$idx]=""
-      node_users[$idx]=""
       node_passes[$idx]="$auth"
-      node_pbks[$idx]=""
-      node_sids[$idx]=""
-      node_snis[$idx]="$sni"
-      node_fps[$idx]=""
       node_obfs[$idx]="$obfs"
-      idx=$((idx+1))
+      node_snis[$idx]="$sni"
+      ((idx++))
     done < <(jq -c 'to_entries[] | select(.value.type=="hysteria2")' "$META" 2>/dev/null)
   fi
+
+  # Argo 节点（只显示，不参与删除编号）
+  local ARGO_FILE="/root/agsbx/jh.txt"
+  if [[ -f "$ARGO_FILE" ]]; then
+    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+      raw_line="${raw_line%%[[:space:]]#*}"
+      raw_line="${raw_line%"${raw_line##*[![:space:]]}"}"
+      [[ -z "$raw_line" || "$raw_line" =~ ^[[:space:]]*# ]] && continue
+      if [[ "$raw_line" =~ ^(vmess|vless|trojan|ss|shadowsocks|hysteria2):// ]]; then
+        local argo_tag="argo-$(date +%s)-$((argo_count++))"
+        node_tags[$idx]="$argo_tag"
+        node_ports[$idx]="Argo"
+        node_types[$idx]="argo"
+        node_raws[$idx]="$raw_line"
+        ((idx++))
+      fi
+    done < "$ARGO_FILE"
+  fi
+
+  if (( idx == 0 )); then say "暂无节点"; set -e; return; fi
 
   local ss_tcp=$(ss -ltnp 2>/dev/null || true)
   local ss_udp=$(ss -lunp 2>/dev/null || true)
 
-  idx=0
-  while (( idx < total + ext_count )); do
-    local port="${node_ports[$idx]}" tag="${node_tags[$idx]}" type="${node_types[$idx]}"
-    say "[$((idx+1))] 端口: $port | 协议: $type | 名称: $tag"
-    if grep -q ":$port " <<<"$ss_tcp" || grep -q ":$port " <<<"$ss_udp"; then
-      : # OK
-    else
-      warn "端口 $port 未监听"
-    fi
+  local i=0
+  while (( i < idx )); do
+    local port="${node_ports[$i]}" tag="${node_tags[$i]}" type="${node_types[$i]}"
+    say "[$((i+1))] 端口: $port | 协议: $type | 名称: $tag"
+    [[ "$port" != "Argo" ]] && ! grep -q ":$port " <<<"$ss_tcp" && ! grep -q ":$port " <<<"$ss_udp" && warn "端口 $port 未监听"
+
     if [[ "$type" == "vless" ]]; then
-      local uuid="${node_uuids[$idx]}" pbk="${node_pbks[$idx]}" sid="${node_sids[$idx]}" sni="${node_snis[$idx]}" fp="${node_fps[$idx]}"
-      if [[ -n "$pbk" && -n "$sid" && -n "$sni" ]]; then
-        say "vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=${fp}#${tag}"
-      else
-        warn "节点参数不完整，无法生成链接"
-      fi
+      local uuid="${node_uuids[$i]}" pbk="${node_pbks[$i]}" sid="${node_sids[$i]}" sni="${node_snis[$i]}" fp="${node_fps[$i]}"
+      [[ -n "$pbk" && -n "$sid" && -n "$sni" ]] && say "vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=${fp}#${tag}" || warn "节点参数不完整"
     elif [[ "$type" == "socks" ]]; then
-      local user="${node_users[$idx]}" pass="${node_passes[$idx]}" encoded
-      encoded=$(printf "%s" "$user:$pass" | base64)
+      local encoded=$(printf "%s:%s" "${node_users[$i]}" "${node_passes[$i]}" | base64 -w0)
       say "IPv4: socks://${encoded}@${GLOBAL_IPV4}:${port}#${tag}"
       [[ -n "$GLOBAL_IPV6" ]] && say "IPv6: socks://${encoded}@[${GLOBAL_IPV6}]:${port}#${tag}"
     elif [[ "$type" == "hysteria2" ]]; then
-      local auth="${node_passes[$idx]}" obfs="${node_obfs[$idx]}" sni="${node_snis[$idx]}"
-      if [[ -n "$auth" && -n "$obfs" && -n "$sni" ]]; then
+      local auth="${node_passes[$i]}" obfs="${node_obfs[$i]}" sni="${node_snis[$i]}"
+      [[ -n "$auth" && -n "$obfs" && -n "$sni" ]] && {
         say "hysteria2://${auth}@${GLOBAL_IPV4}:${port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${tag}"
         [[ -n "$GLOBAL_IPV6" ]] && say "hysteria2://${auth}@[${GLOBAL_IPV6}]:${port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${tag}"
-      else
-        warn "节点参数不完整，无法生成链接"
-      fi
+      } || warn "节点参数不完整"
+    elif [[ "$type" == "argo" ]]; then
+      say "${node_raws[$i]}"
     fi
     say "---------------------------------------------------"
-    idx=$((idx+1))
+    ((i++))
   done
   set -e
 }
-
 delete_node() {
-  local count; count=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null)
-  local ext_count; ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null)
-  if [[ ( -z "$count" || "$count" == "0" ) && ( -z "$ext_count" || "$ext_count" == "0" ) ]]; then say "暂无节点"; return; fi
-  view_nodes
+  local total ext_count real_count
+  total=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo "0")
+  ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null || echo "0")
+  real_count=$((total + ext_count))
+
+  if (( real_count == 0 )); then
+    say "暂无本地节点可删除（Argo 临时节点请重新运行隧道清除）"
+    return
+  fi
+
+  say "================= 可删除的本地节点 =================="
+  view_nodes   # 虽然会显示 Argo，但下面会明确只允许删前 real_count 个
+  say "===================================================="
+  say "提示：Argo 节点（端口为 Argo）无法在此删除"
+  say "      需清除 Argo 节点请重新运行一次【1 → 4 Argo临时隧道】"
+  say "===================================================="
+
   say "[0] 返回主菜单"
-  say "[ss] 删除所有节点"
-  read -rp "请输入要删除的节点序号： " idx
+  say "[ss] 删除所有本地节点"
+  read -rp "请输入要删除的本地节点序号（1-$real_count）: " idx
+
   [[ "$idx" == "0" || -z "$idx" ]] && return
+
   if [[ "$idx" == "ss" ]]; then
-    read -rp " 确认删除全部节点？(y/N): " c; [[ "$c" == "y" ]] || { say "已取消"; return; }
-    local tmpcfg; tmpcfg=$(mktemp)
-    trap 'rm -f "$tmpcfg"' EXIT
-    jq '.inbounds = []' "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
-    printf '{}' >"$META"
+    read -rp "确认删除所有本地节点？(y/N): " c
+    [[ "$c" != "y" && "$c" != "Y" ]] && { say "已取消"; return; }
+    jq '.inbounds = []' "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
+    printf '{}' > "$META"
     shopt -s nullglob
     for f in /etc/systemd/system/hysteria2*.service; do
-      name=$(basename "$f")
-      systemctl disable --now "$name" >/dev/null 2>&1 || true
+      systemctl disable --now "$(basename "$f" .service)" &>/dev/null || true
       rm -f "$f"
     done
     shopt -u nullglob
-    systemctl daemon-reload || log_msg "WARN" "daemon-reload failed"
+    systemctl daemon-reload &>/dev/null || true
     rm -rf /etc/hysteria2
-    ok "所有节点已删除"; return
+    ok "所有本地节点已删除（Argo 节点不受影响）"
+    return
   fi
-  if ! [[ "$idx" =~ ^[0-9]+$ ]]; then warn "无效输入"; return; fi
-  local idx0=$((idx-1))
-  if (( idx0 < 0 || idx0 >= (count + ext_count) )); then warn "序号越界"; return; fi
 
-  if (( idx0 >= count )); then
-    local ext_index=$((idx0 - count))
-    local tag_to_delete; tag_to_delete=$(jq -r --argjson i "$ext_index" 'to_entries | map(select(.value.type=="hysteria2")) | .[$i].key // empty' "$META")
-    if [[ -n "$tag_to_delete" && "$tag_to_delete" != "null" ]]; then
-      local port_del; port_del=$(jq -r --arg t "$tag_to_delete" '.[$t].port // empty' "$META")
-      local tmpmeta; tmpmeta=$(mktemp)
-      trap 'rm -f "$tmpmeta"' EXIT
-      jq "del(.\"$tag_to_delete\")" "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
-      if [[ -f "/etc/systemd/system/hysteria2-${port_del}.service" ]]; then
-        systemctl disable --now "hysteria2-${port_del}" >/dev/null 2>&1 || true
-        rm -f "/etc/systemd/system/hysteria2-${port_del}.service"
-      fi
-      systemctl daemon-reload || log_msg "WARN" "daemon-reload failed"
-      [[ -n "$port_del" ]] && rm -f "/etc/hysteria2/${port_del}.yaml" "/etc/hysteria2/${port_del}.key" "/etc/hysteria2/${port_del}.crt"
-      ok "已删除节点 [$idx]"
-      return
-    fi
+  if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > real_count )); then
+    warn "只能输入 1~$real_count 的序号（Argo 节点不可删除）"
+    return
   fi
-  local tag; tag=$(jq -r ".inbounds[$idx0].tag // empty" "$CONFIG")
-  local tmpcfg; tmpcfg=$(mktemp)
-  trap 'rm -f "$tmpcfg"' EXIT
-  jq "del(.inbounds[$idx0])" "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
-  if [[ -n "$tag" && "$tag" != "null" ]]; then
-    local tmpmeta; tmpmeta=$(mktemp)
-    trap 'rm -f "$tmpmeta"' EXIT
-    jq "del(.\"$tag\")" "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
+
+  local n=$((idx - 1))
+
+  if (( n < total )); then
+    local tag=$(jq -r ".inbounds[$n].tag // empty" "$CONFIG")
+    jq "del(.inbounds[$n])" "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
+    [[ -n "$tag" && "$tag" != "null" ]] && jq "del(.\"$tag\")" "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
+    ok "已删除本地节点 [$idx]"
+  else
+    n=$((n - total))
+    local tag=$(jq -r --argjson i "$n" 'to_entries | map(select(.value.type=="hysteria2")) | .[$i].key' "$META")
+    local port=$(jq -r --arg t "$tag" '.[$t].port // empty' "$META")
+    jq "del(.\"$tag\")" "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
+    [[ -n "$port" ]] && {
+      systemctl disable --now "hysteria2-${port}" &>/dev/null || true
+      rm -f "/etc/systemd/system/hysteria2-${port}.service" "/etc/hysteria2/${port}".{yaml,key,crt}
+    }
+    systemctl daemon-reload &>/dev/null || true
+    ok "已删除 Hysteria2 节点 [$idx]"
   fi
-  ok "已删除节点 [$idx]"
 }
-
 is_docker() {
   # 检查 /.dockerenv 文件（Docker 容器默认会有）
   if [ -f /.dockerenv ]; then
