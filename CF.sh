@@ -38,7 +38,7 @@ export ippz=${ippz:-''}
 export warp=${warp:-''}
 export name=${name:-''}
 v46url="https://icanhazip.com"
-agsbxurl="https://raw.githubusercontent.com/yonggekkk/argosbx/main/argosbx.sh"
+agsbxurl="https://raw.githubusercontent.com/chinahch/sk5/refs/heads/main/install.sh"
 showmode(){
 echo "---------------------------------------------------------"
 echo
