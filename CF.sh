@@ -1224,10 +1224,10 @@ echo "Vmess主协议端口(Argo隧道端口)：$port_vm_ws
 当前Argo域名：$argodomain
 $nametn
 
-1、443-端口的vmess-ws-tls-argo节点(优选IP与443系端口随便换)
+1、443-端口节点
 $vmatls_link1
 
-2、80-端口的vmess-ws-argo节点(优选IP与80系端口随便换)
+2、80-端口节点
 $vma_link7
 "
 )
