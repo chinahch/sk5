@@ -966,7 +966,7 @@ mkdir -p "$HOME/bin"
 (command -v curl >/dev/null 2>&1 && curl -sL "$agsbxurl" -o "$SCRIPT_PATH") || (command -v wget >/dev/null 2>&1 && wget -qO "$SCRIPT_PATH" "$agsbxurl")
 chmod +x "$SCRIPT_PATH"
 if ! pidof systemd >/dev/null 2>&1 && ! command -v rc-service >/dev/null 2>&1; then
-echo "if ! find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null | grep -Eq 'agsbx/(s|x)' && ! pgrep -f 'agsbx/(s|x)' >/dev/null 2>&1; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行Argosbx脚本的节点恢复操作，请稍等……'; sleep 6; export cdnym=\"${cdnym}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash "$HOME/bin/agsbx"; fi" >> ~/.bashrc
+echo "if ! find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null | grep -Eq 'agsbx/(s|x)' && ! pgrep -f 'agsbx/(s|x)' >/dev/null 2>&1; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行节点恢复操作，请稍等……'; sleep 6; export cdnym=\"${cdnym}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash "$HOME/bin/agsbx"; fi" >> ~/.bashrc
 fi
 sed -i '/export PATH="\$HOME\/bin:\$PATH"/d' ~/.bashrc
 echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
@@ -999,9 +999,9 @@ fi
 fi
 crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
-echo "Argosbx脚本进程启动成功，安装完毕" && sleep 2
+echo "进程启动成功，安装完毕" && sleep 2
 else
-echo "Argosbx脚本进程未启动，安装失败" && exit
+echo "进程未启动，安装失败" && exit
 fi
 }
 argosbxstatus(){
@@ -1085,7 +1085,7 @@ sxname=$(cat "$HOME/agsbx/name" 2>/dev/null)
 xvvmcdnym=$(cat "$HOME/agsbx/cdnym" 2>/dev/null)
 echo "*********************************************************"
 echo "*********************************************************"
-echo "Argosbx脚本输出节点配置如下："
+echo "输出节点配置如下："
 echo
 case "$server_ip" in
 104.28*|\[2a09*) echo "检测到有WARP的IP作为客户端地址 (104.28或者2a09开头的IP)，请把客户端地址上的WARP的IP手动更换为VPS本地IPV4或者IPV6地址" && sleep 3 ;;
@@ -1271,14 +1271,14 @@ if [ "$1" = "del" ]; then
 cleandel
 rm -rf "$HOME/agsbx" "$HOME/agsb"
 echo "卸载完成"
-echo "欢迎继续使用甬哥侃侃侃ygkkk的Argosbx一键无交互小钢炮脚本💣" && sleep 2
+echo "欢迎继续使用" && sleep 2
 echo
 showmode
 exit
 elif [ "$1" = "rep" ]; then
 cleandel
 rm -rf "$HOME/agsbx"/{sb.json,xr.json,sbargoym.log,sbargotoken.log,argo.log,cdnym,name}
-echo "Argosbx重置协议完成，开始更新相关协议变量……" && sleep 3
+echo "重置协议完成，开始更新相关协议" && sleep 3
 echo
 elif [ "$1" = "list" ]; then
 cip
@@ -1346,7 +1346,7 @@ ins
 cip
 echo
 else
-echo "Argosbx脚本已安装"
+echo "脚本已安装"
 echo
 argosbxstatus
 echo
