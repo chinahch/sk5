@@ -3,7 +3,7 @@
 # === Ctrl+C 安全处理（只退菜单，不清理/不杀服务） ===
 # ===== 1. 在脚本最上方（其他全局变量附近）新增 =====
 ARGO_CACHE="/root/agsbx/jh.txt"          # Argo 脚本生成的节点文件
-ARGO_META_TAG_PREFIX="argo-tunnel-"      # 为了避免 tag 冲突
+ARGO_META_TAG_PREFIX="Argo-"      # 为了避免 tag 冲突
 on_int_menu_quit_only() {
   restart_singbox >/dev/null 2>&1  # 静默重启 sing-box
   trap - EXIT  # 清空 EXIT trap
@@ -1180,66 +1180,76 @@ restart_singbox() {
 add_node() {
   # 进入添加节点前，再次兜底确保依赖完整
   ensure_runtime_deps
+
   while true; do
     say "请选择协议类型："
     say "0) 返回主菜单"
     say "1) SOCKS5"
     say "2) VLESS-REALITY"
     say "3) Hysteria2"
-    say "4) Argo临时隧道"  # 新增 Argo 临时隧道选项
+    say "4) Argo临时隧道"
     read -rp "输入协议编号（默认 1，输入 0 返回）: " proto
     proto=${proto:-1}
     [[ "$proto" == "0" ]] && return
-    [[ "$proto" =~ ^[1234]$ ]] && break  # 修改以接受 4 作为有效输入
-    warn "无效输入"
+    [[ "$proto" =~ ^[1-4]$ ]] && break
+    warn "无效输入，请重新输入"
   done
 
-  # 处理不同协议类型
+  # ==================== 3. Hysteria2 ====================
   if [[ "$proto" == "3" ]]; then
     add_hysteria2_node || return 1
     return
-  elif [[ "$proto" == "2" ]]; then
-    # VLESS (TCP 语义端口)
+  fi
+
+  # ==================== 2. VLESS-REALITY ====================
+  if [[ "$proto" == "2" ]]; then
     if ! command -v sing-box >/dev/null 2>&1; then
       err "未检测到 sing-box，无法生成 Reality 密钥。请先在“脚本服务”里重装/安装。"
       return 1
     fi
+
     local port proto_type="tcp"
     while true; do
-      if [[ -n "$nat_mode" ]]; then
+      [[ -n "$nat_mode" ]] && {
         [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：VLESS 仅允许使用 自定义TCP端口集合"
-        [[ "$nat_mode" == "range"  ]] && say "已启用范围端口模式：VLESS 仅允许使用 范围内端口"
-      fi
+        [[ "$nat_mode" == "range" ]] && say "已启用范围端口模式：VLESS 仅允许使用 范围内端口"
+      }
       read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " port
+      [[ "$port" == "0" ]] && return
       if [[ -z "$port" ]]; then
         port=$(get_random_allowed_port "$proto_type")
         [[ "$port" == "NO_PORT" ]] && { err "无可用端口"; return 1; }
         say "（已自动选择随机端口：$port）"
       fi
-      [[ "$port" == "0" ]] && return
       [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || { warn "端口无效"; continue; }
       (( port < 1024 )) && warn "端口<1024可能需root权限"
       if ! check_nat_allow "$port" "$proto_type"; then warn "端口 $port 不符合 NAT 规则（协议: $proto_type）"; continue; fi
-      if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then warn "端口 $port 已存在"; continue; fi
-      if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then warn "端口 $port 已被 Hysteria2 使用"; continue; fi
+      if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
+        warn "端口 $port 已存在"; continue
+      fi
+      if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then
+        warn "端口 $port 已被 Hysteria2 使用"; continue
+      fi
       break
     done
 
     local uuid fp flow server_name key_pair private_key public_key short_id tag tmpcfg
-    if command -v uuidgen >/dev/null 2>&1; then uuid=$(uuidgen); else uuid=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/'); fi
+    if command -v uuidgen >/dev/null 2>&1; then
+      uuid=$(uuidgen)
+    else
+      uuid=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/')
+    fi
     server_name="www.cloudflare.com"
     flow="xtls-rprx-vision"
     case $((RANDOM%5)) in 0) fp="chrome";; *) fp="firefox";; esac
-
     key_pair=$(sing-box generate reality-keypair 2>/dev/null)
     private_key=$(awk -F': ' '/PrivateKey/{print $2}' <<<"$key_pair")
     public_key=$(awk -F': ' '/PublicKey/{print $2}' <<<"$key_pair")
     [[ -z "$private_key" || -z "$public_key" ]] && { err "生成 Reality 密钥失败"; return 1; }
     short_id=$(openssl rand -hex 4)
     tag=$(generate_unique_tag)
+    tmpcfg=$(mktemp); trap 'rm -f "$tmpcfg"' RETURN
 
-    tmpcfg=$(mktemp)
-    trap 'rm -f "$tmpcfg"' EXIT
     jq --arg port "$port" \
        --arg uuid "$uuid" \
        --arg prikey "$private_key" \
@@ -1274,27 +1284,22 @@ add_node() {
       err "配置校验失败"; sing-box check -c "$CONFIG"; return 1
     fi
 
-    local tmpmeta; tmpmeta=$(mktemp)
-    trap 'rm -f "$tmpmeta"' EXIT
+    local tmpmeta; tmpmeta=$(mktemp); trap 'rm -f "$tmpmeta"' RETURN
     jq --arg tag "$tag" --arg pbk "$public_key" --arg sid "$short_id" --arg sni "$server_name" --arg port "$port" --arg fp "$fp" \
       '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni, port:$port, fp:$fp}}' "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
 
     say ""; ok "添加成功：VLESS Reality"
-    say "端口: $port"
-    say "UUID: $uuid"
-    say "Public Key: $public_key"
-    say "Short ID: $short_id"
-    say "SNI: $server_name"
-    say "Fingerprint: $fp"
-    say "TAG: $tag"
+    say "端口: $port  UUID: $uuid  Public Key: $public_key  Short ID: $short_id"
+    say "SNI: $server_name  Fingerprint: $fp  TAG: $tag"
     say ""
-    say " 客户端链接："
+    say "客户端链接："
     say "vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=${flow}&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=${fp}#${tag}"
     say ""
     return
-# ===== 2. 把原来的 Argo 分支（在 add_node() 函数内）替换成下面这段 =====
-elif [[ "$proto" == "4" ]]; then
-    # ============ 新增 Argo 临时隧道子菜单 ============
+  fi
+
+  # ==================== 4. Argo 临时隧道 ====================
+  if [[ "$proto" == "4" ]]; then
     while true; do
       say "========== Argo 临时隧道 =========="
       say "1) 安装并运行 Argo 临时隧道"
@@ -1305,92 +1310,86 @@ elif [[ "$proto" == "4" ]]; then
         1)
           say "正在安装并运行 Argo 临时隧道..."
           vmpt="" argo="y" bash <(curl -Ls https://raw.githubusercontent.com/chinahch/sk5/refs/heads/main/CF.sh)
-          
-          # 执行完后自动导入生成的节点文件
+
           if [[ -f "$ARGO_CACHE" ]]; then
-              if import_argo_nodes; then
-                  ok "Argo 临时隧道已启动并成功导入 $(wc -l < "$ARGO_CACHE" 2>/dev/null || echo 0) 个节点"
-              else
-                  warn "Argo 隧道运行中，但节点导入失败（文件不存在或格式错误）"
-              fi
+            if import_argo_nodes; then
+              ok "Argo 临时隧道已启动并成功导入 $(wc -l < "$ARGO_CACHE" 2>/dev/null || echo 0) 个节点"
+            else
+              warn "Argo 隧道运行中，但节点导入失败（文件不存在或格式错误）"
+            fi
           else
-              warn "Argo 隧道脚本执行完成，但未生成节点文件 $ARGO_CACHE"
+            warn "Argo 隧道脚本执行完成，但未生成节点文件 $ARGO_CACHE"
           fi
           break
           ;;
         2)
-          say " ---正在卸载---"
+          say " ---正在卸载 Argo 临时隧道---"
           bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/argosbx/main/argosbx.sh) del >/dev/null 2>&1
-          # 清理本脚本缓存的 Argo 节点（不影响本地 VLESS/SOCKS/Hy2 节点）
-          if [[ -f "$ARGO_CACHE" ]]; then
-              rm -f "$ARGO_CACHE"
-              ok "Argo 临时隧道已卸载，节点缓存文件已删除"
-          else
-              ok "---卸载完成---"
-          fi
-          # 清除 META 中所有 argo 类型的节点记录
+          [[ -f "$ARGO_CACHE" ]] && rm -f "$ARGO_CACHE" && ok "节点缓存文件已删除"
           jq 'to_entries | map(select(.value.type != "argo")) | from_entries' "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
           restart_singbox >/dev/null 2>&1 || true
+          ok "Argo 临时隧道已卸载"
           break
           ;;
-        0)
-          return
-          ;;
+        0) return ;;
         *) warn "无效选项，请重新选择" ;;
       esac
     done
     return
-    # SOCKS5 (TCP 语义端口)
-    local port user pass tag tmpcfg proto_type="tcp"
-    while true; do
-      if [[ -n "$nat_mode" ]]; then
-        [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：SOCKS5 仅允许使用 自定义TCP端口集合"
-        [[ "$nat_mode" == "range"  ]] && say "已启用范围端口模式：SOCKS5 仅允许使用 范围内端口"
-      fi
-      read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " port
-      if [[ -z "$port" ]]; then
-        port=$(get_random_allowed_port "$proto_type")
-        [[ "$port" == "NO_PORT" ]] && { err "无可用端口"; return 1; }
-        say "（已自动选择随机端口：$port）"
-      fi
-      [[ "$port" == "0" ]] && return
-      [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || { warn "端口无效"; continue; }
-      (( port < 1024 )) && warn "端口<1024可能需root权限"
-      if ! check_nat_allow "$port" "$proto_type"; then warn "端口 $port 不符合 NAT 规则（协议: $proto_type）"; continue; fi
-      if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then warn "端口 $port 已存在"; continue; fi
-      if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then warn "端口 $port 已被 Hysteria2 使用"; continue; fi
-      break
-    done
-    read -rp "请输入用户名（默认 user）: " user; user=${user:-user}
-    read -rp "请输入密码（默认 pass123）: " pass; pass=${pass:-pass123}
-    tag="sk5-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
-
-    tmpcfg=$(mktemp)
-    trap 'rm -f "$tmpcfg"' EXIT
-    jq --arg port "$port" --arg user "$user" --arg pass "$pass" --arg tag "$tag" \
-      '.inbounds += [{"type":"socks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"users":[{"username":$user,"password":$pass}]}]' \
-      "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
-
-    say " 正在校验配置..."
-    if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
-      ok "配置通过，正在重启..."
-      restart_singbox || { err "重启失败"; return 1; }
-    else
-      err "配置校验失败"; sing-box check -c "$CONFIG"; return 1
-    fi
-
-    say ""; ok "添加成功：SOCKS5"
-    say "端口: $port"
-    say "用户名: $user"
-    say "密码: $pass"
-    say "TAG: $tag"
-    say ""
-    say " 客户端链接："
-    local creds; creds=$(printf "%s" "$user:$pass" | base64)
-    say "IPv4: socks://${creds}@${GLOBAL_IPV4}:${port}#${tag}"
-    [[ -n "$GLOBAL_IPV6" ]] && say "IPv6: socks://${creds}@[${GLOBAL_IPV6}]:${port}#${tag}"
-    say ""
   fi
+
+  # ==================== 1. SOCKS5（默认） ====================
+  # 走到这里一定是 proto==1
+  local port user pass tag tmpcfg proto_type="tcp"
+  while true; do
+    [[ -n "$nat_mode" ]] && {
+      [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：SOCKS5 仅允许使用 自定义TCP端口集合"
+      [[ "$nat_mode" == "range" ]] && say "已启用范围端口模式：SOCKS5 仅允许使用 范围内端口"
+    }
+    read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " port
+    [[ "$port" == "0" ]] && return
+    if [[ -z "$port" ]]; then
+      port=$(get_random_allowed_port "$proto_type")
+      [[ "$port" == "NO_PORT" ]] && { err "无可用端口"; return 1; }
+      say "（已自动选择随机端口：$port）"
+    fi
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || { warn "端口无效"; continue; }
+    (( port < 1024 )) && warn "端口<1024可能需root权限"
+    if ! check_nat_allow "$port" "$proto_type"; then warn "端口 $port 不符合 NAT 规则（协议: $proto_type）"; continue; fi
+    if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
+      warn "端口 $port 已存在"; continue
+    fi
+    if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then
+      warn "端口 $port 已被 Hysteria2 使用"; continue
+    fi
+    break
+  done
+
+  read -rp "请输入用户名（默认 user）: " user; user=${user:-user}
+  read -rp "请输入密码（默认 pass123）: " pass; pass=${pass:-pass123}
+  tag="sk5-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
+
+  tmpcfg=$(mktemp); trap 'rm -f "$tmpcfg"' RETURN
+  jq --arg port "$port" --arg user "$user" --arg pass "$pass" --arg tag "$tag" \
+    '.inbounds += [{"type":"socks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"users":[{"username":$user,"password":$pass}]}]' \
+    "$CONFIG" >"$tmpcfg" && mv "$tmpcfg" "$CONFIG"
+
+  say " 正在校验配置..."
+  if sing-box check -c "$CONFIG" >/dev/null 2>&1; then
+    ok "配置通过，正在重启 Sing-box..."
+    restart_singbox || { err "重启失败"; return 1; }
+  else
+    err "配置校验失败"; sing-box check -c "$CONFIG"; return 1
+  fi
+
+  say ""; ok "添加成功：SOCKS5"
+  say "端口: $port  用户名: $user  密码: $pass  TAG: $tag"
+  say ""
+  say "客户端链接："
+  local creds; creds=$(printf "%s:%s" "$user" "$pass" | base64)
+  say "IPv4: socks://${creds}@${GLOBAL_IPV4}:${port}#${tag}"
+  [[ -n "$GLOBAL_IPV6" ]] && say "IPv6: socks://${creds}@[${GLOBAL_IPV6}]:${port}#${tag}"
+  say ""
 }
 
 add_hysteria2_node() {
@@ -1590,35 +1589,72 @@ view_nodes() {
       ((idx++))
     done < <(jq -c 'to_entries[] | select(.value.type=="hysteria2")' "$META" 2>/dev/null)
   fi
-
-  # Argo 节点（只显示，不参与删除编号）
+  # Argo 节点（智能识别真实端口 + TLS 状态）
   local ARGO_FILE="/root/agsbx/jh.txt"
   if [[ -f "$ARGO_FILE" ]]; then
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-      raw_line="${raw_line%%[[:space:]]#*}"
-      raw_line="${raw_line%"${raw_line##*[![:space:]]}"}"
+      raw_line="${raw_line%%[[:space:]]#*}"  # 去掉行尾注释
+      raw_line="${raw_line%"${raw_line##*[![:space:]]}"}"  # trim
       [[ -z "$raw_line" || "$raw_line" =~ ^[[:space:]]*# ]] && continue
+
       if [[ "$raw_line" =~ ^(vmess|vless|trojan|ss|shadowsocks|hysteria2):// ]]; then
-        local argo_tag="argo-$(date +%s)-$((argo_count++))"
-        node_tags[$idx]="$argo_tag"
-        node_ports[$idx]="Argo"
-        node_types[$idx]="argo"
+        local real_port="443"   # 默认
+        local tls_status=""
+        local display_port="443"
+        local protocol_name="argo"
+
+        # 1. 先尝试从 base64 解码 vmess（最常见）
+        if [[ "$raw_line" == vmess://* ]]; then
+          local decoded=$(echo "${raw_line#vmess://}" | base64 -d 2>/dev/null || true)
+          if [[ -n "$decoded" ]]; then
+            real_port=$(echo "$decoded" | jq -r '.port // "443"')
+            if [[ "$(echo "$decoded" | jq -r '.tls')" == "tls" ]]; then
+              tls_status=" (TLS)"
+            fi
+            # 如果有 ps 字段，用作名称更友好
+            local ps=$(echo "$decoded" | jq -r '.ps // "Argo-Vmess"')
+            tag="${ARGO_META_TAG_PREFIX}${ps:0:20}"
+          fi
+        fi
+
+        # 2. 如果不是 vmess 或解码失败，尝试直接解析 URL 参数（vless/trojan/ss）
+        if [[ "$real_port" == "443" ]]; then
+          # 提取 port 参数
+          real_port=$(echo "$raw_line" | grep -oE '[:/]port[=:]?([0-9]+)' | tail -1 | grep -oE '[0-9]+' || echo "443")
+          [[ -z "$real_port" || "$real_port" == "null" ]] && real_port="443"
+          # 判断是否 TLS
+          if echo "$raw_line" | grep -qE '[?&]security=tls|[?&]tls=1|":tls"' ; then
+            tls_status=" (TLS)"
+          fi
+        fi
+
+        # 最终显示端口
+        display_port="${real_port}${tls_status}"
+
+        node_tags[$idx]="$tag"
+        node_ports[$idx]="$display_port"
+        node_types[$idx]="$protocol_name"
         node_raws[$idx]="$raw_line"
         ((idx++))
+        ((argo_count++))
       fi
     done < "$ARGO_FILE"
   fi
-
   if (( idx == 0 )); then say "暂无节点"; set -e; return; fi
 
   local ss_tcp=$(ss -ltnp 2>/dev/null || true)
   local ss_udp=$(ss -lunp 2>/dev/null || true)
-
   local i=0
   while (( i < idx )); do
     local port="${node_ports[$i]}" tag="${node_tags[$i]}" type="${node_types[$i]}"
-    say "[$((i+1))] 端口: $port | 协议: $type | 名称: $tag"
-    [[ "$port" != "Argo" ]] && ! grep -q ":$port " <<<"$ss_tcp" && ! grep -q ":$port " <<<"$ss_udp" && warn "端口 $port 未监听"
+    
+    # ===== 只对本地真实监听的节点才检测端口监听状态 =====
+    if [[ "$type" == "argo" ]]; then
+      say "[$((i+1))] 端口: $port | 协议: $type | 名称: $tag"
+    else
+      say "[$((i+1))] 端口: $port | 协议: $type | 名称: $tag"
+      [[ "$port" != "Argo" ]] && ! grep -q ":$port " <<<"$ss_tcp" && ! grep -q ":$port " <<<"$ss_udp" && warn "端口 $port 未监听"
+    fi
 
     if [[ "$type" == "vless" ]]; then
       local uuid="${node_uuids[$i]}" pbk="${node_pbks[$i]}" sid="${node_sids[$i]}" sni="${node_snis[$i]}" fp="${node_fps[$i]}"
@@ -1635,6 +1671,8 @@ view_nodes() {
       } || warn "节点参数不完整"
     elif [[ "$type" == "argo" ]]; then
       say "${node_raws[$i]}"
+      # 可选：加一行说明，更专业
+      say "   └ Argo 隧道流量走 Cloudflare（无需本地监听）"
     fi
     say "---------------------------------------------------"
     ((i++))
