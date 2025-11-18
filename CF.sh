@@ -954,7 +954,7 @@ fi
 if [ -n "${argodomain}" ]; then
 echo "Argo$argoname隧道申请成功"
 else
-echo "Argo$argoname隧道申请失败，请稍后再试"
+echo "-----------------------------------------------"
 fi
 fi
 echo
@@ -1236,7 +1236,7 @@ echo
 echo "---------------------------------------------------------"
 echo "$argoshow"
 echo "---------------------------------------------------------"
-echo "聚合节点信息，请进入 $HOME/agsbx/jh.txt 文件目录查看或者运行 cat $HOME/agsbx/jh.txt 查看"
+echo "节点信息，请进入 $HOME/agsbx/jh.txt 文件目录查看或者运行 cat $HOME/agsbx/jh.txt 查看"
 echo "========================================================="
 showmode
 }
