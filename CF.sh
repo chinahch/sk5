@@ -44,9 +44,6 @@ echo "---------------------------------------------------------"
 echo
 }
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "Argosbx一键无交互脚本"
-echo "当前版本：V25.10.5"
-echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
 [ -z "$(systemd-detect-virt 2>/dev/null)" ] && vi=$(virt-what 2>/dev/null) || vi=$(systemd-detect-virt 2>/dev/null)
@@ -1010,11 +1007,6 @@ fi
 argosbxstatus(){
 echo "=========当前三大内核运行状态========="
 procs=$(find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null)
-if echo "$procs" | grep -Eq 'agsbx/s' || pgrep -f 'agsbx/s' >/dev/null 2>&1; then
-echo "Sing-box：运行中"
-else
-echo "Sing-box：未启用"
-fi
 if echo "$procs" | grep -Eq 'agsbx/x' || pgrep -f 'agsbx/x' >/dev/null 2>&1; then
 echo "Xray：运行中"
 else
@@ -1365,7 +1357,7 @@ fi
 v4orv6
 echo "VPS系统：$op"
 echo "CPU架构：$cpu"
-echo "Argosbx脚本未安装，开始安装…………" && sleep 2
+echo "开始安装…………" && sleep 2
 setenforce 0 >/dev/null 2>&1
 iptables -P INPUT ACCEPT >/dev/null 2>&1
 iptables -P FORWARD ACCEPT >/dev/null 2>&1
