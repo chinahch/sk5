@@ -1176,21 +1176,23 @@ restart_singbox() {
 
 # ============= 节点操作（含 NAT 端口约束） =============
 add_node() {
-# 进入添加节点前，再次兜底确保依赖完整
-ensure_runtime_deps
+  # 进入添加节点前，再次兜底确保依赖完整
+  ensure_runtime_deps
   while true; do
     say "请选择协议类型："
     say "0) 返回主菜单"
     say "1) SOCKS5"
     say "2) VLESS-REALITY"
     say "3) Hysteria2"
+    say "4) Argo临时隧道"  # 新增 Argo 临时隧道选项
     read -rp "输入协议编号（默认 1，输入 0 返回）: " proto
     proto=${proto:-1}
     [[ "$proto" == "0" ]] && return
-    [[ "$proto" =~ ^[123]$ ]] && break
+    [[ "$proto" =~ ^[1234]$ ]] && break  # 修改以接受 4 作为有效输入
     warn "无效输入"
   done
 
+  # 处理不同协议类型
   if [[ "$proto" == "3" ]]; then
     add_hysteria2_node || return 1
     return
@@ -1203,7 +1205,7 @@ ensure_runtime_deps
     local port proto_type="tcp"
     while true; do
       if [[ -n "$nat_mode" ]]; then
-        [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：VLESS 仅允许使用 自定义TCP端口 集合"
+        [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：VLESS 仅允许使用 自定义TCP端口集合"
         [[ "$nat_mode" == "range"  ]] && say "已启用范围端口模式：VLESS 仅允许使用 范围内端口"
       fi
       read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " port
@@ -1288,12 +1290,19 @@ ensure_runtime_deps
     say "vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=${flow}&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=${fp}#${tag}"
     say ""
     return
+  elif [[ "$proto" == "4" ]]; then
+    # Argo 临时隧道配置逻辑
+
+    say "正在执行 Argo 临时隧道配置..."
+    vmpt="" argo="y" bash <(curl -Ls https://raw.githubusercontent.com/chinahch/sk5/refs/heads/main/CF.sh)
+    say "Argo 临时隧道配置完成"
+    return
   else
     # SOCKS5 (TCP 语义端口)
     local port user pass tag tmpcfg proto_type="tcp"
     while true; do
       if [[ -n "$nat_mode" ]]; then
-        [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：SOCKS5 仅允许使用 自定义TCP端口 集合"
+        [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：SOCKS5 仅允许使用 自定义TCP端口集合"
         [[ "$nat_mode" == "range"  ]] && say "已启用范围端口模式：SOCKS5 仅允许使用 范围内端口"
       fi
       read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " port
