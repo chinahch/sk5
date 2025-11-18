@@ -1335,7 +1335,7 @@ fi
 v4orv6
 echo "VPS系统：$op"
 echo "CPU架构：$cpu"
-echo "开始安装…………" && sleep 2
+echo "---开始安装---" && sleep 2
 setenforce 0 >/dev/null 2>&1
 iptables -P INPUT ACCEPT >/dev/null 2>&1
 iptables -P FORWARD ACCEPT >/dev/null 2>&1
