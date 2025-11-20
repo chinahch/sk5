@@ -142,6 +142,34 @@ sb233_run_install_silent() {
 # - 当端口池用尽时明确提示；自动选择端口必定输出数字
 # - 菜单与提示语符合你的中文文案
 umask 022
+# ============= 样式定义 =============
+# 颜色代码
+C_RESET='\033[0m'
+C_GREEN='\033[32m'    # 绿色 (横线/标题)
+C_YELLOW='\033[33m'   # 黄色 (链接)
+C_CYAN='\033[36m'     # 青色 (属性值)
+C_RED='\033[31m'      # 红色 (警告)
+
+# 通用卡片打印函数
+# 参数: 1=标题(如协议名) 2=节点名称 3=核心信息(如IP/域名:端口) 4=链接
+print_card() {
+  local title="$1"
+  local name="$2"
+  local info="$3"
+  local link="$4"
+
+  echo ""
+  echo -e "${C_GREEN}=========================================================${C_RESET}"
+  echo -e "${C_GREEN}                 ${title}                         ${C_RESET}"
+  echo -e "${C_GREEN}=========================================================${C_RESET}"
+  echo ""
+  echo -e "节点名称: ${C_CYAN}${name}${C_RESET}"
+  echo -e "${info}" # info 内部需自行包含颜色或格式
+  echo ""
+  echo -e "【 节点链接 】"
+  echo -e "${C_YELLOW}${link}${C_RESET}"
+  echo ""
+}
 
 CONFIG="/etc/sing-box/config.json"
 META="/etc/sing-box/nodes_meta.json"
@@ -1291,20 +1319,17 @@ add_node() {
     jq --arg tag "$tag" --arg pbk "$public_key" --arg sid "$short_id" --arg sni "$server_name" --arg port "$port" --arg fp "$fp" \
       '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni, port:$port, fp:$fp}}' "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
 
-    say ""; ok "添加成功：VLESS Reality"
-    say "端口: $port  UUID: $uuid  Public Key: $public_key  Short ID: $short_id"
-    say "SNI: $server_name  Fingerprint: $fp  TAG: $tag"
-    say ""
-    say "客户端链接："
-    say "vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=${flow}&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=${fp}#${tag}"
-    say ""
+    # --- 样式优化 ---
+    local link="vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=${flow}&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=${fp}#${tag}"
+    local info="本地端口: ${C_CYAN}${port}${C_RESET}\nSNI域名: ${C_CYAN}${server_name}${C_RESET}\nUUID: ${C_CYAN}${uuid}${C_RESET}"
+    print_card "VLESS-REALITY 搭建成功" "$tag" "$info" "$link"
+    
     return
   fi
 
   # ==================== 4. Argo 隧道（临时 + 固定）===================
   if [[ "$proto" == "4" ]]; then
     while true; do
-      clear
       say "========== Argo 隧道管理 =========="
       say "1) 安装临时隧道"
       say "2) 安装固定隧道"
@@ -1313,48 +1338,287 @@ add_node() {
       read -rp "请选择: " argo_choice
       case "$argo_choice" in
         1)
-          say "正在安装并运行 Argo 临时隧道..."
-          vmpt="" argo="y" bash <(curl -Ls https://raw.githubusercontent.com/chinahch/sk5/refs/heads/main/CF.sh)
-          if [[ -f "$ARGO_CACHE" ]]; then
-            import_argo_nodes && ok "Argo 临时隧道已启动并成功导入节点" || warn "节点导入失败"
+          set +e 
+          local workdir="/root/agsbx"
+          mkdir -p "$workdir"
+          rm -f "$workdir/argo.log" "$ARGO_TEMP_CACHE"
+
+          # --- 1. 智能识别节点名称 ---
+          say "正在识别 IP 归属信息..."
+          local api_res=$(curl -s -m 5 "http://ip-api.com/line/?fields=isp,countryCode")
+          local node_name="Argo-Node"
+          
+          if [ -n "$api_res" ]; then
+              local raw_isp=$(echo "$api_res" | head -n1)
+              local code=$(echo "$api_res" | head -n2 | tail -n1)
+              local safe_isp=${raw_isp%% *} 
+              safe_isp=$(echo "$safe_isp" | tr -cd 'a-zA-Z0-9')
+              code=$(echo "$code" | tr -cd 'a-zA-Z')
+              [ -z "$safe_isp" ] && safe_isp="VPS"
+              [ -z "$code" ] && code="UN"
+              node_name="${safe_isp}-${code}"
           else
-            warn "临时隧道运行中，但未生成节点缓存文件"
+              warn "IP 信息获取超时，使用默认名称"
           fi
-          read -rp "按回车继续..." _
+
+          # --- 2. 下载核心文件 ---
+          local c_cpu c_argo
+          case "$(uname -m)" in
+              aarch64) c_cpu="arm64-v8a"; c_argo="arm64" ;;
+              x86_64) c_cpu="64"; c_argo="amd64" ;;
+              *) err "不支持的架构"; return ;;
+          esac
+
+          download_file() {
+              local url="$1"
+              local dest="$2"
+              if [ ! -e "$dest" ]; then
+                  say "正在下载 $(basename "$dest")..."
+                  wget -qO "$dest" "$url" || curl -L -s -o "$dest" "$url"
+              fi
+          }
+
+          download_file "https://github.com/XTLS/Xray-core/releases/download/v1.8.11/Xray-linux-${c_cpu}.zip" "$workdir/xray.zip"
+          if [ -e "$workdir/xray.zip" ]; then
+              if ! command -v unzip >/dev/null; then
+                   apt-get update -y >/dev/null 2>&1 && apt-get install -y unzip >/dev/null 2>&1 || yum install -y unzip >/dev/null 2>&1
+              fi
+              unzip -o "$workdir/xray.zip" -d "$workdir" "xray" >/dev/null 2>&1
+              rm -f "$workdir/xray.zip"
+              chmod +x "$workdir/xray"
+          fi
+
+          download_file "https://github.com/cloudflare/cloudflared/releases/download/2024.6.1/cloudflared-linux-${c_argo}" "$workdir/cloudflared"
+          chmod +x "$workdir/cloudflared"
+
+          # --- 3. 生成配置与启动 ---
+          local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
+          if [ -z "$uuid" ]; then uuid=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/'); fi
+          
+          local port=$(shuf -i 10000-60000 -n 1)
+          local ws_path="/${uuid}-vm"
+          
+          cat > "$workdir/config.json" <<EOF
+{
+  "log": { "loglevel": "none" },
+  "inbounds": [
+    {
+      "port": ${port},
+      "listen": "127.0.0.1",
+      "protocol": "vmess",
+      "settings": { "clients": [ { "id": "${uuid}", "alterId": 0 } ] },
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "${ws_path}" } }
+    }
+  ],
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
+}
+EOF
+
+          pkill -f "$workdir/xray" >/dev/null 2>&1
+          pkill -f "$workdir/cloudflared" >/dev/null 2>&1
+
+          "$workdir/xray" run -c "$workdir/config.json" >/dev/null 2>&1 &
+          sleep 2
+
+          say "正在申请 Argo 临时域名 (请等待约 15 秒)..."
+          nohup "$workdir/cloudflared" tunnel --url "http://127.0.0.1:${port}" --edge-ip-version auto --no-autoupdate > "$workdir/argo.log" 2>&1 &
+
+          local argo_url=""
+          for i in {1..20}; do
+              sleep 1
+              argo_url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$workdir/argo.log" | head -n 1 | sed 's/https:\/\///')
+              if [ -n "$argo_url" ]; then break; fi
+              printf "."
+          done
+          echo ""
+
+          if [ -z "$argo_url" ]; then
+              err "域名获取失败！请查看日志: cat $workdir/argo.log"
+              read -rp "按回车返回..." _
+              return
+          fi
+
+          local vm_json='{
+            "v": "2",
+            "ps": "'$node_name'",
+            "add": "www.visa.com.sg",
+            "port": "443",
+            "id": "'$uuid'",
+            "aid": "0",
+            "scy": "auto",
+            "net": "ws",
+            "type": "none",
+            "host": "'$argo_url'",
+            "path": "/'$uuid'-vm",
+            "tls": "tls",
+            "sni": "'$argo_url'",
+            "alpn": ""
+          }'
+          local vmess_link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
+          echo "$vmess_link" > "$ARGO_TEMP_CACHE"
+
+          # --- 样式优化 ---
+          local info="Argo 域名: ${C_CYAN}${argo_url}${C_RESET}"
+          print_card "Argo 临时隧道搭建成功" "$node_name" "$info" "$vmess_link"
+
+          if command -v crontab >/dev/null 2>&1; then
+              crontab -l 2>/dev/null | grep -v "agsbx" > /tmp/crontab.tmp
+              echo "@reboot sleep 10 && nohup $workdir/xray run -c $workdir/config.json >/dev/null 2>&1 &" >> /tmp/crontab.tmp
+              echo "@reboot sleep 15 && nohup $workdir/cloudflared tunnel --url http://127.0.0.1:${port} --edge-ip-version auto --no-autoupdate > $workdir/argo.log 2>&1 &" >> /tmp/crontab.tmp
+              crontab /tmp/crontab.tmp
+              rm -f /tmp/crontab.tmp
+          fi
+          import_argo_nodes >/dev/null 2>&1 
+          read -rp "请复制上方链接，按回车返回..." _
           ;;
         2)
-          # 固定隧道自定义参数
+          set +e
           say "========== 安装 Argo 固定隧道 =========="
-          read -rp "请输入 Vmess-WS 端口（默认 8080）: " vmpt_input
-          vmpt_input=${vmpt_input:-8080}
-          read -rp "请输入 隧道域名（例如 abc.xyz.com）: " agn_input
-          [[ -z "$agn_input" ]] && { warn "域名不能为空！"; read -rp "按回车重试..." _; continue; }
-          read -rp "请输入 隧道Token: " agk_input
-          [[ -z "$agk_input" ]] && { warn "Token 不能为空！"; read -rp "按回车重试..." _; continue; }
-
-          say "正在安装固定 Argo 隧道..."
-          vmpt="$vmpt_input" argo="y" agn="$agn_input" agk="$agk_input" bash <(curl -Ls https://raw.githubusercontent.com/chinahch/sk5/refs/heads/main/CF.sh)
-
-          # 固定隧道不会生成 jh.txt，所以我们手动生成一条 vmess-ws 节点供显示
-          if [[ -n "$agn_input" && -n "$vmpt_input" ]]; then
-            local uuid=$(uuidgen || openssl rand -hex 16)
-            local vmess_link="vmess://$(echo -n "{\"v\":\"2\",\"ps\":\"Argo-Fixed-${agn_input}\",\"add\":\"${agn_input}\",\"port\":\"${vmpt_input}\",\"id\":\"${uuid}\",\"aid\":0,\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${agn_input}\",\"path\":\"/\",\"tls\":\"tls\",\"sni\":\"${agn_input}\",\"alpn\":\"\"}" | base64 -w0)"
-                        mkdir -p /root/agsbx 2>/dev/null
-            echo "$vmess_link" > "$ARGO_FIXED_CACHE"      # 改成 gd.txt
-            # 如果之前有旧的临时 jh.txt，不动它，保持共存
-            import_argo_nodes && ok "固定隧道已启动，节点已写入 gd.txt 并成功导入" || warn "导入失败"
+          
+          read -rp "请输入 Vmess-WS 本地监听端口（默认自动随机）: " vmpt_input
+          if [[ -z "$vmpt_input" ]]; then
+              vmpt_input=$(shuf -i 10000-60000 -n 1)
+              say "已随机选择端口: $vmpt_input"
           fi
-          read -rp "安装完成，按回车继续..." _
+          
+          read -rp "请输入 隧道域名（例如 abc.xyz.com）: " agn_input
+          [[ -z "$agn_input" ]] && { warn "域名不能为空！"; read -rp "按回车重试..." _; return; }
+          
+          read -rp "请输入 隧道Token (eyJh...): " agk_input
+          [[ -z "$agk_input" ]] && { warn "Token 不能为空！"; read -rp "按回车重试..." _; return; }
+
+          say "正在配置固定 Argo 隧道..."
+          local workdir="/root/agsbx"
+          mkdir -p "$workdir"
+          
+          local c_cpu c_argo
+          case "$(uname -m)" in
+              aarch64) c_cpu="arm64-v8a"; c_argo="arm64" ;;
+              x86_64) c_cpu="64"; c_argo="amd64" ;;
+              *) err "不支持的架构: $(uname -m)"; return ;;
+          esac
+          
+          if ! command -v unzip >/dev/null 2>&1; then
+               say "正在安装 unzip..."
+               if command -v apt-get >/dev/null 2>&1; then
+                   apt-get update -y >/dev/null 2>&1 && apt-get install -y unzip >/dev/null 2>&1
+               elif command -v yum >/dev/null 2>&1; then
+                   yum install -y unzip >/dev/null 2>&1
+               fi
+          fi
+
+          if [ -x "$workdir/xray" ]; then
+              ok "检测到 Xray 核心已存在，跳过下载。"
+          else
+              say "正在下载 Xray 核心..."
+              local x_url="https://github.com/XTLS/Xray-core/releases/download/v1.8.11/Xray-linux-${c_cpu}.zip"
+              wget -qO "$workdir/xray.zip" "$x_url" || curl -L -s -o "$workdir/xray.zip" "$x_url"
+              if [ -f "$workdir/xray.zip" ]; then
+                  unzip -o "$workdir/xray.zip" -d "$workdir" "xray" >/dev/null 2>&1
+                  rm -f "$workdir/xray.zip"
+                  chmod +x "$workdir/xray"
+              else
+                  err "Xray 下载失败。"; read -rp "按回车返回..." _; return
+              fi
+          fi
+          
+          if [ -x "$workdir/cloudflared" ]; then
+              ok "检测到 Cloudflared 核心已存在，跳过下载。"
+          else
+              say "正在下载 Cloudflared..."
+              local c_url="https://github.com/cloudflare/cloudflared/releases/download/2024.6.1/cloudflared-linux-${c_argo}"
+              wget -qO "$workdir/cloudflared" "$c_url" || curl -L -s -o "$workdir/cloudflared" "$c_url"
+              if [ ! -f "$workdir/cloudflared" ]; then
+                  err "Cloudflared 下载失败。"; read -rp "按回车返回..." _; return
+              fi
+              chmod +x "$workdir/cloudflared"
+          fi
+
+          local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
+          if [ -z "$uuid" ]; then uuid=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/'); fi
+          local ws_path="/${uuid}-vm"
+
+          cat > "$workdir/config_fixed.json" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "port": ${vmpt_input},
+      "listen": "127.0.0.1",
+      "protocol": "vmess",
+      "settings": { "clients": [ { "id": "${uuid}", "alterId": 0 } ] },
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "${ws_path}" } }
+    }
+  ],
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
+}
+EOF
+
+          pkill -f "$workdir/xray" >/dev/null 2>&1
+          pkill -f "$workdir/cloudflared" >/dev/null 2>&1
+
+          nohup "$workdir/xray" run -c "$workdir/config_fixed.json" >/dev/null 2>&1 &
+          sleep 2
+
+          say "正在启动固定 Argo 隧道..."
+          nohup "$workdir/cloudflared" tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token "$agk_input" --url "http://127.0.0.1:${vmpt_input}" > "$workdir/argo_fixed.log" 2>&1 &
+          
+          sleep 5
+          if pgrep -f "cloudflared" >/dev/null; then ok "固定隧道进程已启动"; else warn "固定隧道启动似乎失败，请检查 Token"; fi
+
+          local vm_json='{
+            "v": "2",
+            "ps": "Argo-Fixed-'$agn_input'",
+            "add": "'$agn_input'",
+            "port": "443",
+            "id": "'$uuid'",
+            "aid": "0",
+            "scy": "auto",
+            "net": "ws",
+            "type": "none",
+            "host": "'$agn_input'",
+            "path": "/'$uuid'-vm",
+            "tls": "tls",
+            "sni": "'$agn_input'",
+            "alpn": ""
+          }'
+          local vmess_link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
+          echo "$vmess_link" > "$ARGO_FIXED_CACHE"
+          
+          if command -v crontab >/dev/null 2>&1; then
+              crontab -l 2>/dev/null | grep -v "agsbx" > /tmp/crontab.tmp
+              echo "@reboot sleep 10 && nohup $workdir/xray run -c $workdir/config_fixed.json >/dev/null 2>&1 &" >> /tmp/crontab.tmp
+              echo "@reboot sleep 15 && nohup $workdir/cloudflared tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $agk_input --url http://127.0.0.1:${vmpt_input} > $workdir/argo_fixed.log 2>&1 &" >> /tmp/crontab.tmp
+              crontab /tmp/crontab.tmp
+              rm -f /tmp/crontab.tmp
+          fi
+          import_argo_nodes && ok "固定隧道节点已添加"
+          
+          # --- 样式优化 ---
+          local info="隧道域名: ${C_CYAN}${agn_input}${C_RESET}\n本地端口: ${C_CYAN}${vmpt_input}${C_RESET}"
+          print_card "Argo 固定隧道安装完成" "Argo-Fixed" "$info" "$vmess_link"
+          
+          read -rp "按回车继续..." _
           ;;
         3)
-          say "正在彻底卸载 Argo（临时+固定）..."
-          bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/argosbx/main/argosbx.sh) del >/dev/null 2>&1 || true
-          pkill -f "cloudflared" >/dev/null 2>&1 || true
-                    rm -f "$ARGO_TEMP_CACHE" "$ARGO_FIXED_CACHE"
-          # 同时清空 META 里所有 argo 节点
-          jq 'to_entries | map(select(.value.type != "argo")) | from_entries' "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
+          set +e
+          say "========== 卸载 Argo 隧道 =========="
+          say "正在停止进程并清理文件..."
+          pkill -f "/root/agsbx/xray" >/dev/null 2>&1 || true
+          pkill -f "/root/agsbx/cloudflared" >/dev/null 2>&1 || true
+          rm -rf "/root/agsbx"
+          rm -f "$ARGO_TEMP_CACHE" "$ARGO_FIXED_CACHE"
+          if [[ -f "$META" ]]; then
+              jq 'to_entries | map(select(.value.type != "argo")) | from_entries' "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
+          fi
+          if command -v crontab >/dev/null 2>&1; then
+              crontab -l 2>/dev/null | grep -v "agsbx" > /tmp/crontab.tmp
+              if [[ -s /tmp/crontab.tmp ]]; then crontab /tmp/crontab.tmp; else crontab -r >/dev/null 2>&1; fi
+              rm -f /tmp/crontab.tmp
+          fi
+          say "正在刷新节点列表..."
           restart_singbox >/dev/null 2>&1 || true
-          ok "Argo 已彻底卸载"
+          ok "Argo 已彻底卸载 (进程/文件/自启/节点记录 已清空)"
           read -rp "按回车继续..." _
           ;;
         0) return ;;
@@ -1363,8 +1627,8 @@ add_node() {
     done
     return
   fi
+
   # ==================== 1. SOCKS5（默认） ====================
-  # 走到这里一定是 proto==1
   local port user pass tag tmpcfg proto_type="tcp"
   while true; do
     [[ -n "$nat_mode" ]] && {
@@ -1407,16 +1671,14 @@ add_node() {
     err "配置校验失败"; sing-box check -c "$CONFIG"; return 1
   fi
 
-  say ""; ok "添加成功：SOCKS5"
-  say "端口: $port  用户名: $user  密码: $pass  TAG: $tag"
-  say ""
-  say "客户端链接："
+  # --- 样式优化 ---
   local creds; creds=$(printf "%s:%s" "$user" "$pass" | base64)
-  say "IPv4: socks://${creds}@${GLOBAL_IPV4}:${port}#${tag}"
-  [[ -n "$GLOBAL_IPV6" ]] && say "IPv6: socks://${creds}@[${GLOBAL_IPV6}]:${port}#${tag}"
-  say ""
+  local link="socks://${creds}@${GLOBAL_IPV4}:${port}#${tag}"
+  local info="本地端口: ${C_CYAN}${port}${C_RESET}\n用户名: ${C_CYAN}${user}${C_RESET}\n密码: ${C_CYAN}${pass}${C_RESET}"
+  print_card "SOCKS5 搭建成功" "$tag" "$info" "$link"
+  [[ -n "$GLOBAL_IPV6" ]] && echo -e "IPv6 链接: socks://${creds}@[IPv6]:${port}#${tag}"
+  echo ""
 }
-
 add_hysteria2_node() {
   local port proto_type="udp"
   ensure_runtime_deps
@@ -1525,17 +1787,12 @@ EOF
   jq --arg tag "$tag" --arg port "$port" --arg sni "$domain" --arg obfs "$obfs_pwd" --arg auth "$auth_pwd" \
     '. + {($tag): {type:"hysteria2", port:$port, sni:$sni, obfs:$obfs, auth:$auth}}' "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
 
-  say ""; ok "添加成功：Hysteria2"
-  say "端口: $port"
-  say "Auth密码: $auth_pwd"
-  say "Obfs密码: $obfs_pwd"
-  say "SNI域名: $domain"
-  say "TAG: $tag"
-  say ""
-  say " 客户端链接："
-  [[ -n "$GLOBAL_IPV4" ]] && say "hysteria2://${auth_pwd}@${GLOBAL_IPV4}:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${domain}&insecure=1#${tag}"
-  [[ -n "$GLOBAL_IPV6" ]] && say "hysteria2://${auth_pwd}@[${GLOBAL_IPV6}]:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${domain}&insecure=1#${tag}"
-  say ""
+  # --- 样式优化 ---
+  local link="hysteria2://${auth_pwd}@${GLOBAL_IPV4}:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${domain}&insecure=1#${tag}"
+  local info="本地端口: ${C_CYAN}${port}${C_RESET}\nAuth密码: ${C_CYAN}${auth_pwd}${C_RESET}\nObfs密码: ${C_CYAN}${obfs_pwd}${C_RESET}"
+  print_card "Hysteria2 搭建成功" "$tag" "$info" "$link"
+  [[ -n "$GLOBAL_IPV6" ]] && echo -e "IPv6 链接: hysteria2://${auth_pwd}@[${GLOBAL_IPV6}]:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${domain}&insecure=1#${tag}"
+  echo ""
 }
 # ===== 3. 在脚本任意位置（建议放在 add_hysteria2_node 之后）新增这个完整函数 =====
 import_argo_nodes() {
@@ -1571,112 +1828,93 @@ import_argo_nodes() {
     return 0
 }
 view_nodes() {
+  local filter_mode="$1" # 接受参数：normal (普通) 或 argo (隧道)
   set +e
 
-  local total ext_count argo_count=0
-  total=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo "0")
-  ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null || echo "0")
+  local total ext_count
+  # 仅在需要普通节点时读取 config 和 meta
+  if [[ "$filter_mode" == "normal" ]]; then
+    total=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo "0")
+    ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null || echo "0")
+  fi
 
   declare -A node_ports node_types node_tags node_raws
-
   local idx=0
 
-  # ==================== 1. sing-box 本地节点 ====================
-  while read -r line; do
-    local tag port type
-    tag=$(jq -r '.tag' <<<"$line")
-    port=$(jq -r '.listen_port // empty' <<<"$line")
-    type=$(jq -r '.type' <<<"$line")
-
-    node_tags[$idx]="$tag"
-    node_ports[$idx]="${port:-未知}"
-    node_types[$idx]="$type"
-    node_raws[$idx]=""   # 本地节点不存 raw
-    ((idx++))
-  done < <(jq -c '.inbounds[]' "$CONFIG" 2>/dev/null)
-
-  # ==================== 2. Hysteria2 节点 ====================
-  if (( ext_count > 0 )); then
-    while read -r key; do
-      local tag port
-      tag="$key"
-      port=$(jq -r --arg t "$tag" '.[$t].port // "未知"' "$META")
-      node_tags[$idx]="$tag"
-      node_ports[$idx]="$port"
-      node_types[$idx]="hysteria2"
-      node_raws[$idx]=""
+  # ==================== 数据读取部分 (保持不变) ====================
+  # 1. 读取 sing-box 本地节点
+  if [[ "$filter_mode" == "normal" ]]; then
+    while read -r line; do
+      local tag port type
+      tag=$(jq -r '.tag' <<<"$line")
+      port=$(jq -r '.listen_port // empty' <<<"$line")
+      type=$(jq -r '.type' <<<"$line")
+      node_tags[$idx]="$tag"; node_ports[$idx]="${port:-未知}"; node_types[$idx]="$type"; node_raws[$idx]=""
       ((idx++))
-    done < <(jq -r 'to_entries[] | select(.value.type=="hysteria2") | .key' "$META")
-  fi
+    done < <(jq -c '.inbounds[]' "$CONFIG" 2>/dev/null)
 
-  # ==================== 3. Argo 隧道节点（核心修复） ====================
-  local ARGO_FILE="/root/agsbx/jh.txt"
-  if [[ -f "$ARGO_FILE" ]]; then
-    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-      raw_line="${raw_line%%[[:space:]]#*}"    # 去注释
-      raw_line="${raw_line%"${raw_line##*[![:space:]]}"}"  # trim
-      [[ -z "$raw_line" ]] && continue
-
-      local scheme host port=443 path name tls=""
-
-      # 统一提取协议、host、port、path、ps
-      if [[ "$raw_line" =~ ^(vmess|vless|trojan|ss|shadowsocks|hysteria|hysteria2):// ]]; then
-        scheme="${BASH_REMATCH[1]}"
-
-        case "$scheme" in
-          vmess)
-            local decoded=$(echo "${raw_line#vmess://}" | base64 -d 2>/dev/null)
-            if [[ -n "$decoded" ]]; then
-              host=$(jq -r '.add // ""' <<<"$decoded")
-              port=$(jq -r '.port // "443"' <<<"$decoded")
-              path=$(jq -r '.path // ""' <<<"$decoded")
-              name=$(jq -r '.ps // "Argo-Vmess"' <<<"$decoded" | sed 's/[^a-zA-Z0-9_-]//g')
-              [[ "$(jq -r '.tls // "none"' <<<"$decoded")" == "tls" ]] && tls=" (TLS)"
-            fi
-            ;;
-          *)
-            # vless / trojan / ss / hysteria2
-            # 提取 host（@之前）
-            host=$(echo "$raw_line" | sed -r 's/^.*@([^:/?#]+).*$/\1/')
-            # 提取端口
-            if [[ "$raw_line" =~ :([0-9]+)[^0-9] ]]; then
-              port="${BASH_REMATCH[1]}"
-            fi
-            # 提取 path
-            path=$(echo "$raw_line" | grep -oE 'path=[^&#]*' | cut -d= -f2- | head -n1 || echo "")
-            # 提取 ps / #名称
-            name=$(echo "$raw_line" | sed -r 's/.*#([^&]*)$/\1/' | urlencode -d 2>/dev/null || echo "Argo-${scheme^}")
-            name="${name// /_}"
-            # 判断是否 TLS
-            if echo "$raw_line" | grep -qiE 'security=tls|tls=1|type=ws.*tls'; then
-              tls=" (TLS)"
-            fi
-            ;;
-        esac
-
-        # 安全过滤
-        [[ -z "$host" ]] && host="unknown.cf"
-        [[ -z "$name" || "$name" == "null" ]] && name="Argo-${scheme^}"
-
-        node_tags[$idx]="${ARGO_META_TAG_PREFIX}${name:0:25}"
-        node_ports[$idx]="${port}${tls}"
-        node_types[$idx]="argo"
-        node_raws[$idx]="$raw_line"
+    # 2. 读取 Hysteria2 节点
+    if (( ext_count > 0 )); then
+      while read -r key; do
+        local tag port
+        tag="$key"
+        port=$(jq -r --arg t "$tag" '.[$t].port // "未知"' "$META")
+        node_tags[$idx]="$tag"; node_ports[$idx]="$port"; node_types[$idx]="hysteria2"; node_raws[$idx]=""
         ((idx++))
-        ((argo_count++))
-      fi
-    done < "$ARGO_FILE"
+      done < <(jq -r 'to_entries[] | select(.value.type=="hysteria2") | .key' "$META")
+    fi
   fi
 
-  # ==================== 输出 ====================
+  # 3. 读取 Argo 隧道节点
+  if [[ "$filter_mode" == "argo" ]]; then
+    local files=(); [[ -f "$ARGO_TEMP_CACHE" ]] && files+=("$ARGO_TEMP_CACHE"); [[ -f "$ARGO_FIXED_CACHE" ]] && files+=("$ARGO_FIXED_CACHE")
+    for f in "${files[@]}"; do
+      while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        raw_line="${raw_line%%[[:space:]]#*}"; raw_line="${raw_line%"${raw_line##*[![:space:]]}"}"
+        [[ -z "$raw_line" ]] && continue
+        if [[ "$raw_line" =~ ^(vmess|vless|trojan|ss|shadowsocks|hysteria|hysteria2):// ]]; then
+          local scheme="${BASH_REMATCH[1]}"
+          local port="443" name="Argo-${scheme^}" tls=""
+          case "$scheme" in
+            vmess)
+              local decoded=$(echo "${raw_line#vmess://}" | base64 -d 2>/dev/null)
+              if [[ -n "$decoded" ]]; then
+                port=$(jq -r '.port // "443"' <<<"$decoded")
+                name=$(jq -r '.ps // "Argo-Vmess"' <<<"$decoded" | sed 's/[^a-zA-Z0-9_-]//g')
+                [[ "$(jq -r '.tls // "none"' <<<"$decoded")" == "tls" ]] && tls=" (TLS)"
+              fi ;;
+            *)
+              if [[ "$raw_line" =~ :([0-9]+)[^0-9] ]]; then port="${BASH_REMATCH[1]}"; fi
+              name=$(echo "$raw_line" | sed -r 's/.*#([^&]*)$/\1/' | urlencode -d 2>/dev/null || echo "Argo-${scheme^}")
+              name="${name// /_}"; if echo "$raw_line" | grep -qiE 'security=tls|tls=1|type=ws.*tls'; then tls=" (TLS)"; fi ;;
+          esac
+          [[ -z "$name" || "$name" == "null" ]] && name="Argo-${scheme^}"
+          node_tags[$idx]="${ARGO_META_TAG_PREFIX}${name:0:25}"
+          node_ports[$idx]="${port}${tls}"
+          node_types[$idx]="argo"
+          node_raws[$idx]="$raw_line"
+          ((idx++))
+        fi
+      done < "$f"
+    done
+  fi
+
+  # ==================== 输出显示 (紧凑优化版) ====================
   if (( idx == 0 )); then
-    say "暂无节点"
+    say "当前分类下暂无节点"
     set -e
     return
   fi
 
-  local ss_tcp=$(ss -ltnp 2>/dev/null || true)
-  local ss_udp=$(ss -lunp 2>/dev/null || true)
+  local ss_tcp="" ss_udp=""
+  if [[ "$filter_mode" == "normal" ]]; then
+      ss_tcp=$(ss -ltnp 2>/dev/null || true)
+      ss_udp=$(ss -lunp 2>/dev/null || true)
+  fi
+
+  echo ""
+  echo -e "${C_GREEN}序号  协议        端口         名称${C_RESET}"
+  echo "---------------------------------------------------------"
 
   local i=0
   while (( i < idx )); do
@@ -1684,21 +1922,12 @@ view_nodes() {
     local port="${node_ports[$i]}"
     local type="${node_types[$i]}"
     local raw="${node_raws[$i]}"
+    local display_link=""
 
+    # 1. 准备链接
     if [[ "$type" == "argo" ]]; then
-      printf "[$((i+1))] 协议: %-10s | 端口: %-8s | 名称: %s\n" "$type" "$port" "$tag"
-      printf "   └ %s\n" "$raw"
-      printf "   └ Argo 隧道流量走 Cloudflare（无需本地监听）\n"
+      display_link="$raw"
     else
-      printf "[$((i+1))] 端口: %-6s | 协议: %-10s | 名称: %s" "$port" "$type" "$tag"
-      # 本地端口未监听就标红警告
-      if [[ "$port" =~ ^[0-9]+$ ]] && ! grep -q ":$port " <<<"$ss_tcp$ss_udp" &>/dev/null; then
-        printf "  [未监听!]\n"
-      else
-        printf "\n"
-      fi
-
-      # 输出客户端链接（本地节点）
       case "$type" in
         vless)
           local uuid=$(jq -r --arg t "$tag" '.[$t].uuid // empty' "$META")
@@ -1706,34 +1935,70 @@ view_nodes() {
           local sid=$(jq -r --arg t "$tag" '.[$t].sid // empty' "$META")
           local sni=$(jq -r --arg t "$tag" '.[$t].sni // "www.cloudflare.com"' "$META")
           local fp=$(jq -r --arg t "$tag" '.[$t].fp // "chrome"' "$META")
-          [[ -n "$uuid" && -n "$pbk" ]] && printf "vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&pbk=%s&sid=%s&sni=%s&fp=%s#%s\n" \
-            "$uuid" "$GLOBAL_IPV4" "$port" "$pbk" "$sid" "$sni" "$fp" "$tag"
+          [[ -n "$uuid" && -n "$pbk" ]] && display_link="vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=${fp}#${tag}"
           ;;
         socks)
-          local user=$(jq -r --arg t "$tag" '.[$t].username // "user"' "$META")
-          wait, no — socks 节点信息在 config.json 里
-          # 简化：直接从 config 重新取
           local info=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | "\(.users[0].username):\(.users[0].password)"' "$CONFIG")
           local creds=$(printf "%s" "$info" | base64 -w0)
-          printf "socks://%s@%s:%s#%s\n" "$creds" "$GLOBAL_IPV4" "$port" "$tag"
-          [[ -n "$GLOBAL_IPV6" ]] && printf "socks://%s@[IPv6]:%s#%s\n" "$creds" "$port" "$tag"
+          display_link="socks://${creds}@${GLOBAL_IPV4}:${port}#${tag}"
           ;;
         hysteria2)
           local auth=$(jq -r --arg t "$tag" '.[$t].auth // empty' "$META")
           local obfs=$(jq -r --arg t "$tag" '.[$t].obfs // empty' "$META")
           local sni=$(jq -r --arg t "$tag" '.[$t].sni // "bing.com"' "$META")
-          [[ -n "$auth" ]] && printf "hysteria2://%s@%s:%s?obfs=salamander&obfs-password=%s&sni=%s&insecure=1#%s\n" \
-            "$auth" "$GLOBAL_IPV4" "$port" "$obfs" "$sni" "$tag"
+          [[ -n "$auth" ]] && display_link="hysteria2://${auth}@${GLOBAL_IPV4}:${port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${tag}"
           ;;
       esac
     fi
-    printf "%s\n" "---------------------------------------------------"
+
+    # 2. 准备状态标识 (监听检测)
+    local status_mark=""
+    if [[ "$type" != "argo" ]]; then
+      if [[ "$port" =~ ^[0-9]+$ ]] && ! grep -q ":$port " <<<"$ss_tcp$ss_udp" &>/dev/null; then
+        status_mark="${C_RED}[未运行]${C_RESET}"
+      fi
+    fi
+    
+    # 3. 紧凑输出
+    # 格式：[序号] 协议(绿) | 端口(青) | 名称(青) [状态]
+    # 换行：链接(黄)
+    printf "[%2d] ${C_GREEN}%-10s${C_RESET} | ${C_CYAN}%-10s${C_RESET} | ${C_CYAN}%s${C_RESET} %s\n" \
+           "$((i+1))" "${type^^}" "${port}" "${tag}" "${status_mark}"
+    
+    echo -e "     ${C_YELLOW}${display_link}${C_RESET}"
+    echo -e "${C_RESET}---------------------------------------------------------${C_RESET}"
+    
     ((i++))
   done
   set -e
 }
+view_nodes_menu() {
+  while true; do
+    say ""
+    say "========== 查看节点 =========="
+    say "1) 普通节点 (SOCKS5 / VLESS / Hysteria2)"
+    say "2) 隧道节点 (Argo 临时 / 固定)"
+    say "0) 返回主菜单"
+    read -rp "请选择查看类型: " v_opt
+    case "$v_opt" in
+      1) 
+        say "--- 普通节点列表 ---"
+        view_nodes "normal" 
+        read -rp "按回车继续..." _
+        ;;
+      2) 
+        say "--- 隧道节点列表 ---"
+        view_nodes "argo"
+        read -rp "按回车继续..." _
+        ;;
+      0) return ;;
+      *) warn "无效输入" ;;
+    esac
+  done
+}
 delete_node() {
   local total ext_count real_count
+  # 计算本地节点数量 (Sing-box + Hysteria2)
   total=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo "0")
   ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null || echo "0")
   real_count=$((total + ext_count))
@@ -1744,10 +2009,11 @@ delete_node() {
   fi
 
   say "================= 可删除的本地节点 =================="
-  view_nodes   # 虽然会显示 Argo，但下面会明确只允许删前 real_count 个
+  # 核心修复：这里增加了 "normal" 参数，强制显示普通节点列表
+  view_nodes "normal"   
   say "===================================================="
   say "提示：Argo 节点（端口为 Argo）无法在此删除"
-  say "      需清除 Argo 节点请重新运行一次【1 → 4 Argo临时隧道】"
+  say "      需清除 Argo 节点请重新运行一次【1 → 4 Argo临时隧道 → 3 卸载】"
   say "===================================================="
 
   say "[0] 返回主菜单"
@@ -1759,8 +2025,18 @@ delete_node() {
   if [[ "$idx" == "ss" ]]; then
     read -rp "确认删除所有本地节点？(y/N): " c
     [[ "$c" != "y" && "$c" != "Y" ]] && { say "已取消"; return; }
+    
+    # 清空 sing-box 入站
     jq '.inbounds = []' "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
-    printf '{}' > "$META"
+    
+    # 清空 META (只保留 argo 类型的记录)
+    if [[ -f "$META" ]]; then
+        jq 'to_entries | map(select(.value.type == "argo")) | from_entries' "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
+    else
+        printf '{}' > "$META"
+    fi
+    
+    # 停止并删除所有 hysteria2 服务
     shopt -s nullglob
     for f in /etc/systemd/system/hysteria2*.service; do
       systemctl disable --now "$(basename "$f" .service)" &>/dev/null || true
@@ -1769,31 +2045,40 @@ delete_node() {
     shopt -u nullglob
     systemctl daemon-reload &>/dev/null || true
     rm -rf /etc/hysteria2
+    
+    # 重启生效
+    restart_singbox >/dev/null 2>&1
     ok "所有本地节点已删除（Argo 节点不受影响）"
     return
   fi
 
   if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > real_count )); then
-    warn "只能输入 1~$real_count 的序号（Argo 节点不可删除）"
+    warn "只能输入 1~$real_count 的序号"
     return
   fi
 
   local n=$((idx - 1))
 
+  # 判断是 sing-box 节点还是 hysteria2 节点
   if (( n < total )); then
+    # 删除 Sing-box 节点
     local tag=$(jq -r ".inbounds[$n].tag // empty" "$CONFIG")
     jq "del(.inbounds[$n])" "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
     [[ -n "$tag" && "$tag" != "null" ]] && jq "del(.\"$tag\")" "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
+    restart_singbox >/dev/null 2>&1
     ok "已删除本地节点 [$idx]"
   else
+    # 删除 Hysteria2 节点
     n=$((n - total))
     local tag=$(jq -r --argjson i "$n" 'to_entries | map(select(.value.type=="hysteria2")) | .[$i].key' "$META")
     local port=$(jq -r --arg t "$tag" '.[$t].port // empty' "$META")
+    
     jq "del(.\"$tag\")" "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
-    [[ -n "$port" ]] && {
+    
+    if [[ -n "$port" ]]; then
       systemctl disable --now "hysteria2-${port}" &>/dev/null || true
       rm -f "/etc/systemd/system/hysteria2-${port}.service" "/etc/hysteria2/${port}".{yaml,key,crt}
-    }
+    fi
     systemctl daemon-reload &>/dev/null || true
     ok "已删除 Hysteria2 节点 [$idx]"
   fi
@@ -1884,7 +2169,7 @@ main_menu() {
   show_version_info
   say "============= 嘻嘻哈哈 节点管理工具（IPv4 + IPv6） ============="
   say "1) 添加节点"
-  say "2) 查看所有节点"
+  say "2) 查看节点 (分类查看)"  # 修改了描述
   say "3) 删除节点"
   say "4) 脚本服务"
   say "5) NAT 模式设置"
@@ -1893,7 +2178,7 @@ main_menu() {
   read -rp "请输入操作编号: " choice
   case "$choice" in
     1) add_node ;;
-    2) view_nodes ;;
+    2) view_nodes_menu ;;  # <--- 这里修改为调用新菜单
     3) delete_node ;;
     4) script_services_menu ;;
     5) nat_mode_menu ;;
