@@ -2172,37 +2172,53 @@ fi
 echo "系统: $SYSTEM_INFO"
 
 show_version_info() {
-  local OS OS_NAME VIRT
-  OS=$(detect_os)
-  if [[ "$OS" == "unknown" ]]; then
-    OS_NAME="未知"
-  else
-    OS_NAME="${OS^}"
-  fi
+  local OS OS_NAME VIRT BIN OUT VER ARCH
 
-  # 检测虚拟化类型
+  # --- 1. 系统检测 (保持原样) ---
+  OS=$(detect_os)
+  [[ "$OS" == "unknown" ]] && OS_NAME="未知" || OS_NAME="${OS^}"
+
   if command -v systemd-detect-virt >/dev/null 2>&1; then
     VIRT=$(systemd-detect-virt)
-    if [[ "$VIRT" != "none" && -n "$VIRT" ]]; then
-      OS_NAME="${OS_NAME}（${VIRT}）"
-    fi
-  else
-    # Docker/LXC 兜底检测
-    if [[ -f /.dockerenv ]] || grep -qE "/docker/|/lxc/" /proc/1/cgroup 2>/dev/null; then
-      OS_NAME="${OS_NAME}（docker）"
-    fi
+    [[ "$VIRT" != "none" && -n "$VIRT" ]] && OS_NAME="${OS_NAME}（${VIRT}）"
+  elif is_docker; then
+    OS_NAME="${OS_NAME}（docker）"
   fi
 
-  SINGBOX_BIN=$(command -v sing-box || echo "/usr/local/bin/sing-box")
-  if [[ -x "$SINGBOX_BIN" ]]; then
-    VER=$($SINGBOX_BIN version 2>/dev/null | head -n1 | awk '{print $NF}')
-    ENV=$($SINGBOX_BIN version 2>/dev/null | awk -F'Environment: ' '/Environment:/{print $2}')
-    say "Sing-box 版本: ${VER:-未知}  | 架构: ${ENV:-未知}  | 系统: ${OS_NAME}"
+  # --- 2. 增强的路径查找 (修复版本显示未知的关键) ---
+  # 优先查找常用路径，防止 command -v 在某些 sudo 环境下失效
+  if [[ -x "/usr/local/bin/sing-box" ]]; then
+    BIN="/usr/local/bin/sing-box"
+  elif [[ -x "/usr/bin/sing-box" ]]; then
+    BIN="/usr/bin/sing-box"
+  elif [[ -x "/etc/sing-box/bin/sing-box" ]]; then
+    BIN="/etc/sing-box/bin/sing-box"
+  elif command -v sing-box >/dev/null 2>&1; then
+    BIN="$(command -v sing-box)"
   else
-    say "Sing-box 版本: 未知  | 架构: 未知  | 系统: ${OS_NAME}"
+    BIN=""
+  fi
+
+  # --- 3. 适配新版输出格式 ---
+  if [[ -n "$BIN" && -x "$BIN" ]]; then
+    OUT=$("$BIN" version 2>/dev/null)
+    
+    # 获取版本号：匹配 "version 1.x.x"
+    VER=$(echo "$OUT" | grep -oE 'version [0-9.]+(-[a-zA-Z0-9]+)?' | head -n1 | awk '{print $2}')
+    
+    # 获取架构：新版不再显示 "Environment:"，改为直接显示 "linux/amd64" 等
+    ARCH=$(echo "$OUT" | grep -oE '(linux|android|darwin|windows)/(amd64|arm64|386|s390x|riscv64)' | head -n1)
+    
+    # 如果没抓到架构，尝试抓取 go 版本作为替代
+    if [[ -z "$ARCH" ]]; then
+       ARCH=$(echo "$OUT" | grep -oE 'go[0-9.]+' | head -n1)
+    fi
+
+    say "Sing-box 版本: ${VER:-未知}  | 架构: ${ARCH:-未知}  | 系统: ${OS_NAME}"
+  else
+    say "Sing-box 版本: 未安装  | 架构: -     | 系统: ${OS_NAME}"
   fi
 }
-
 # ============= 脚本服务菜单 =============
 script_services_menu() {
   while true; do
