@@ -739,21 +739,39 @@ WRAP
 }
 
 install_autostart_fallback() {
+  # 1. 尝试标准的 Alpine OpenRC 配置 (针对有 init 的容器)
   if [[ -f /etc/alpine-release ]]; then
-    # Alpine: 使用 local.d 脚本和 rc-update 确保自启动
     mkdir -p /etc/local.d
     cat > /etc/local.d/sb-singbox.start <<'EOL'
 #!/bin/sh
-/usr/local/bin/sb-singleton >> $LOG_FILE 2>&1 &
+/usr/local/bin/sb-singleton >> /var/log/sing-box.log 2>&1 &
 EOL
     chmod +x /etc/local.d/sb-singbox.start
-    rc-update add local default >/dev/null 2>&1 || log_msg "WARN" "rc-update failed"
+    # 尝试添加到 OpenRC，失败也不报错，继续下面的 Profile 注入
+    rc-update add local default >/dev/null 2>&1 || true
   else
-    # 其他系统：使用 rc.local
+    # 其他系统：尝试 rc.local
     ensure_rc_local_template
   fi
 
-  # 添加 Cron 看门狗 (@reboot + 每分钟)，防止进程退出
+  # 2. 关键修复：针对 Docker 环境的 Profile 注入
+  # 大多数 Docker 容器启动时会加载 /etc/profile 或 ~/.profile
+  if is_docker || [[ -f /.dockerenv ]]; then
+    local start_cmd="/usr/local/bin/sb-singleton >> /var/log/sing-box.log 2>&1 &"
+    
+    # 遍历常见的 profile 文件
+    for profile in /etc/profile /root/.profile /root/.bashrc /root/.ashrc; do
+      # 如果文件存在，且里面没有写过启动命令
+      if [[ -f "$profile" ]] && ! grep -q "sb-singleton" "$profile"; then
+        echo "" >> "$profile"
+        echo "# Sing-box Autostart (Docker Fix)" >> "$profile"
+        echo "$start_cmd" >> "$profile"
+        log_msg "INFO" "Added autostart to $profile"
+      fi
+    done
+  fi
+
+  # 3. 添加 Cron 看门狗 (@reboot + 每分钟)，作为双重保险
   if command -v crontab >/dev/null 2>&1; then
     local marker="# sing-box-watchdog"
     crontab -l 2>/dev/null | grep -v "$marker" > /tmp/crontab.tmp 2>/dev/null || true
