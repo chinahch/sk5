@@ -1029,29 +1029,73 @@ reinstall_menu() {
       read -rp "确认继续 (y/N): " confirm
       [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
-      # 停止服务并清理
-      systemctl stop sing-box 2>/dev/null
-      systemctl disable sing-box 2>/dev/null
-      shopt -s nullglob
-      for f in /etc/systemd/system/hysteria2*.service; do
-        name=$(basename "$f")
-        systemctl stop "$name" 2>/dev/null || true
-        systemctl disable "$name" 2>/dev/null || true
-      done
-      shopt -u nullglob
+      # --- 1. 停止服务与进程 (兼容所有系统) ---
+      say "正在停止服务..."
+      # 尝试 systemd
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now sing-box >/dev/null 2>&1 || true
+        shopt -s nullglob
+        for f in /etc/systemd/system/hysteria2*.service; do
+          systemctl disable --now "$(basename "$f")" >/dev/null 2>&1 || true
+        done
+        shopt -u nullglob
+      fi
+      # 尝试 OpenRC
+      if command -v rc-service >/dev/null 2>&1; then
+        rc-service sing-box stop >/dev/null 2>&1 || true
+        rc-update del sing-box default >/dev/null 2>&1 || true
+      fi
+      
+      # 强制查杀残留进程 (防止容器内僵尸进程)
+      pkill -9 -x sing-box >/dev/null 2>&1 || true
+      pkill -9 -x hysteria >/dev/null 2>&1 || true
+      pkill -9 -f "sb-singleton" >/dev/null 2>&1 || true
+      pkill -9 -f "cloudflared" >/dev/null 2>&1 || true
+      pkill -9 -f "xray" >/dev/null 2>&1 || true
+
+      # --- 2. 清理文件 ---
+      say "正在清理文件..."
+      # Systemd 文件
       rm -f /etc/systemd/system/sing-box.service
       rm -f /lib/systemd/system/sing-box.service
       rm -f /etc/systemd/system/hysteria2*.service
       rm -f /lib/systemd/system/hysteria2*.service
+      [ -n "$(command -v systemctl)" ] && systemctl daemon-reload >/dev/null 2>&1 || true
+
+      # OpenRC 文件
+      rm -f /etc/init.d/sing-box
+      rm -f /etc/local.d/sb-singbox.start
+
+      # 二进制与配置
       rm -f /usr/local/bin/sing-box /usr/bin/sing-box
       rm -f /usr/local/bin/hysteria /usr/bin/hysteria
-      rm -rf /etc/sing-box /var/lib/sing-box /var/log/sing-box /tmp/sing-box*
-      rm -rf /etc/hysteria2 /var/lib/hysteria2 /var/log/hysteria2 /tmp/hysteria2*
-      rm -f "$META"
-      apt-get clean
-      systemctl daemon-reload
+      rm -f /usr/local/bin/sb-singleton
+      rm -rf /etc/sing-box /var/lib/sing-box /var/log/sing-box* /tmp/sing-box*
+      rm -rf /etc/hysteria2 /var/lib/hysteria2 /var/log/hysteria2* /tmp/hysteria2*
+      rm -rf /root/agsbx  # Argo 相关目录
+      rm -f "$META" "$NAT_FILE"
+      
+      # --- 3. 清理自启残留 (Cron/rc.local/Profile) ---
+      say "正在清理自启配置..."
+      # 清理 Crontab
+      if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -v "sb-singleton" | grep -v "agsbx" | crontab - >/dev/null 2>&1 || true
+      fi
+      
+      # 清理 rc.local
+      if [ -f /etc/rc.local ]; then
+        sed -i '/sb-singleton/d' /etc/rc.local
+      fi
+      
+      # 清理 profile (Docker 修复残留)
+      for profile in /etc/profile /root/.profile /root/.bashrc /root/.ashrc; do
+        if [ -f "$profile" ]; then
+           sed -i '/sb-singleton/d' "$profile"
+           sed -i '/# Sing-box Autostart/d' "$profile"
+        fi
+      done
 
-      say " Sing-box、Hysteria2 已完全卸载"
+      say " Sing-box、Hysteria2 及 Argo 已完全卸载"
 
       # 删除当前脚本文件
       SCRIPT_PATH="$(realpath "$0")"
@@ -1060,7 +1104,6 @@ reinstall_menu() {
       echo "脚本已删除，程序退出。"
       exit 0
       ;;
-
     2)
       systemctl stop sing-box 2>/dev/null
       echo " 正在重新安装 Sing-box（保留节点配置）..."
@@ -2206,7 +2249,7 @@ main_menu() {
 }
 
 # ============= 启动入口（终极容器版）=============
-sb233_run_install_silent || true
+# sb233_run_install_silent || true    <--- 注释掉这行
 
 ensure_dirs
 install_dependencies
