@@ -1190,7 +1190,7 @@ add_node() {
     say "1) SOCKS5"
     say "2) VLESS-REALITY"
     say "3) Hysteria2"
-    say "4) Argo临时隧道"
+    say "4) Argo隧道(临时/固定)"
     read -rp "输入协议编号（默认 1，输入 0 返回）: " proto
     proto=${proto:-1}
     [[ "$proto" == "0" ]] && return
