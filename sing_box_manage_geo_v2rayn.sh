@@ -1902,7 +1902,7 @@ view_nodes() {
   declare -A node_ports node_types node_tags node_raws
   local idx=0
 
-  # ==================== 数据读取部分 (保持不变) ====================
+  # ==================== 数据读取部分 ====================
   # 1. 读取 sing-box 本地节点
   if [[ "$filter_mode" == "normal" ]]; then
     while read -r line; do
@@ -1960,7 +1960,7 @@ view_nodes() {
     done
   fi
 
-  # ==================== 输出显示 (紧凑优化版) ====================
+  # ==================== 输出显示 ====================
   if (( idx == 0 )); then
     say "当前分类下暂无节点"
     set -e
@@ -1991,12 +1991,17 @@ view_nodes() {
     else
       case "$type" in
         vless)
-          local uuid=$(jq -r --arg t "$tag" '.[$t].uuid // empty' "$META")
+          # === 修复部分开始 ===
+          # 优先从 config.json 读取 UUID，因为 META 文件通常不存 UUID
+          local uuid=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid // empty' "$CONFIG")
+          
           local pbk=$(jq -r --arg t "$tag" '.[$t].pbk // empty' "$META")
           local sid=$(jq -r --arg t "$tag" '.[$t].sid // empty' "$META")
           local sni=$(jq -r --arg t "$tag" '.[$t].sni // "www.cloudflare.com"' "$META")
           local fp=$(jq -r --arg t "$tag" '.[$t].fp // "chrome"' "$META")
+          
           [[ -n "$uuid" && -n "$pbk" ]] && display_link="vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=${fp}#${tag}"
+          # === 修复部分结束 ===
           ;;
         socks)
           local info=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | "\(.users[0].username):\(.users[0].password)"' "$CONFIG")
@@ -2021,8 +2026,6 @@ view_nodes() {
     fi
     
     # 3. 紧凑输出
-    # 格式：[序号] 协议(绿) | 端口(青) | 名称(青) [状态]
-    # 换行：链接(黄)
     printf "[%2d] ${C_GREEN}%-10s${C_RESET} | ${C_CYAN}%-10s${C_RESET} | ${C_CYAN}%s${C_RESET} %s\n" \
            "$((i+1))" "${type^^}" "${port}" "${tag}" "${status_mark}"
     
