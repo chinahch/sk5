@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# sk5.sh 旧版风格 + Argo 永久自启修复版
-# 作者：你 + Grok 联合修改（2025-11-18）
-# Argo 已改为调用 chinahch 当前最新的 CF.sh（systemd 自启，永不失联）
+# sk5.sh 融合 Misaka-blog Hysteria2 一键逻辑版
+# 修改内容：Hysteria2 部署改为全自动（随机端口/证书/密码），直接出节点
 
-ARGO_TEMP_CACHE="/root/agsbx/jh.txt"      # 临时隧道
-ARGO_FIXED_CACHE="/root/agsbx/gd.txt"     # 固定隧道（我们新建的）
-ARGO_META_TAG_PREFIX="Argo-"             # 防止 tag 冲突
+ARGO_TEMP_CACHE="/root/agsbx/jh.txt"
+ARGO_FIXED_CACHE="/root/agsbx/gd.txt"
+ARGO_META_TAG_PREFIX="Argo-"
 
-# Ctrl+C 只退菜单，不杀服务
 on_int_menu_quit_only() {
   restart_singbox >/dev/null 2>&1
   trap - EXIT
@@ -17,7 +15,6 @@ trap on_int_menu_quit_only INT
 trap '' SIGHUP 2>/dev/null || true
 
 daemonize() { setsid "$@" </dev/null >/dev/null 2>&1 & }
-# 提示用户使用 Bash 运行
 if [ -z "$BASH_VERSION" ]; then
   echo "本脚本需要 Bash 解释器，请使用 Bash 运行。"
   exit 1
@@ -141,17 +138,14 @@ sb233_run_install_silent() {
 # - 移除错误的自调用包装函数，避免递归
 # - 当端口池用尽时明确提示；自动选择端口必定输出数字
 # - 菜单与提示语符合你的中文文案
+# ============= 基础工具与变量定义（保持你原脚本头部不变） =============
 umask 022
-# ============= 样式定义 =============
-# 颜色代码
 C_RESET='\033[0m'
-C_GREEN='\033[32m'    # 绿色 (横线/标题)
-C_YELLOW='\033[33m'   # 黄色 (链接)
-C_CYAN='\033[36m'     # 青色 (属性值)
-C_RED='\033[31m'      # 红色 (警告)
+C_GREEN='\033[32m'
+C_YELLOW='\033[33m'
+C_CYAN='\033[36m'
+C_RED='\033[31m'
 
-# 通用卡片打印函数
-# 参数: 1=标题(如协议名) 2=节点名称 3=核心信息(如IP/域名:端口) 4=链接
 print_card() {
   local title="$1"
   local name="$2"
@@ -164,7 +158,7 @@ print_card() {
   echo -e "${C_GREEN}=========================================================${C_RESET}"
   echo ""
   echo -e "节点名称: ${C_CYAN}${name}${C_RESET}"
-  echo -e "${info}" # info 内部需自行包含颜色或格式
+  echo -e "${info}"
   echo ""
   echo -e "【 节点链接 】"
   echo -e "${C_YELLOW}${link}${C_RESET}"
@@ -175,7 +169,6 @@ CONFIG="/etc/sing-box/config.json"
 META="/etc/sing-box/nodes_meta.json"
 NAT_FILE="/etc/sing-box/nat_ports.json"
 LOG_FILE="/var/log/sing-box.log"
-
 DEPS_CHECKED=0  # 新增全局标志，避免重复依赖检查
 
 say()  { printf "%s\n" "$*"; }
@@ -1331,7 +1324,15 @@ add_node() {
     else
       uuid=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/')
     fi
-    server_name="www.cloudflare.com"
+    # === 修改开始：允许自定义伪装域名 ===
+read -rp "请输入伪装域名 (默认 www.microsoft.com): " input_sni
+if [[ -z "$input_sni" ]]; then
+  server_name="www.microsoft.com"
+else
+  server_name="$input_sni"
+fi
+say "已选择伪装域名: $server_name"
+# === 修改结束 ===
     flow="xtls-rprx-vision"
     case $((RANDOM%5)) in 0) fp="chrome";; *) fp="firefox";; esac
     key_pair=$(sing-box generate reality-keypair 2>/dev/null)
@@ -1741,39 +1742,86 @@ EOF
   echo ""
 }
 add_hysteria2_node() {
-  local port proto_type="udp"
   ensure_runtime_deps
+  
+  # --- 修改开始：支持自定义端口 ---
+  local port proto_type="udp"
+  
   while true; do
-    if [[ -n "$nat_mode" ]]; then
-      [[ "$nat_mode" == "custom" ]] && say "已启用自定义端口模式：Hysteria2 仅允许使用 自定义UDP端口 集合"
-      [[ "$nat_mode" == "range"  ]] && say "已启用范围端口模式：Hysteria2 仅允许使用 范围内端口"
+    read -rp "请输入 Hysteria2 端口 (留空则自动随机): " input_port
+    
+    if [[ -z "$input_port" ]]; then
+      # === 自动模式 (原有逻辑) ===
+      say "正在自动寻找可用 UDP 端口..."
+      local found_port=0
+      for i in {1..10}; do
+          port=$(get_random_allowed_port "$proto_type")
+          if [[ "$port" == "NO_PORT" ]]; then
+              err "无可用端口，请检查 NAT 规则或端口占用"
+              return 1
+          fi
+          
+          # 检查占用
+          if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then continue; fi
+          if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then continue; fi
+          if port_status "$port"; then continue; fi
+          
+          found_port=1
+          break
+      done
+      
+      if [[ $found_port -eq 0 ]]; then
+          err "自动分配端口失败，请手动检查系统端口占用情况。"
+          return 1
+      fi
+      break
+    else
+      # === 自定义模式 ===
+      if ! [[ "$input_port" =~ ^[0-9]+$ ]] || (( input_port < 1 || input_port > 65535 )); then
+          warn "端口无效，请输入 1-65535 之间的数字"
+          continue
+      fi
+      
+      port="$input_port"
+      
+      # 检查 NAT 规则
+      if ! check_nat_allow "$port" "$proto_type"; then 
+         warn "该端口不符合当前的 NAT 端口规则 (协议: $proto_type)"
+         continue
+      fi
+      
+      # 检查端口占用
+      if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
+          warn "端口 $port 已被 Sing-box 其他节点占用"
+          continue
+      fi
+      if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then
+          warn "端口 $port 已被其他 Hysteria2 节点占用"
+          continue
+      fi
+      if port_status "$port"; then
+          warn "系统端口 $port 已被占用"
+          continue
+      fi
+      
+      break
     fi
-    read -rp "请输入端口号（留空自动挑选允许端口；输入 0 返回）: " port
-    if [[ -z "$port" ]]; then
-      port=$(get_random_allowed_port "$proto_type")
-      [[ "$port" == "NO_PORT" ]] && { err "无可用端口"; return 1; }
-      say "（已自动选择随机端口：$port）"
-    fi
-    [[ "$port" == "0" ]] && return
-    [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || { warn "端口无效"; continue; }
-    (( port < 1024 )) && warn "端口<1024可能需root权限"
-    if ! check_nat_allow "$port" "$proto_type"; then warn "端口 $port 不符合 NAT 规则（协议: $proto_type）"; continue; fi
-    if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then warn "端口 $port 已被 sing-box 使用"; continue; fi
-    if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then warn "端口 $port 已存在"; continue; fi
-    break
   done
+  # --- 修改结束 ---
+  
+  say "已选定端口: $port"
 
-  local domain="bing.com"
-
+  # 2. 安装 Hysteria 2 核心 (如果不存在)
   if ! command -v hysteria >/dev/null 2>&1; then
-    warn "未检测到 hysteria，正在安装..."
-    local H_VERSION="2.6.2"
+    say "正在安装 Hysteria 2 核心..."
+    local H_VERSION="2.6.2" # 保持稳定版本
     local arch=$(uname -m)
     case "$arch" in
       x86_64|amd64) arch="amd64" ;;
       aarch64|arm64) arch="arm64" ;;
       *) err "暂不支持的架构：$arch"; return 1 ;;
     esac
+    
     local tmp; tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     (
@@ -1782,45 +1830,55 @@ add_hysteria2_node() {
       curl -sSL "https://github.com/apernet/hysteria/releases/download/app/v${H_VERSION}/hysteria-linux-${arch}" -o hysteria-bin || { err "下载 hysteria 失败"; exit 1; }
       install -m 0755 hysteria-bin /usr/local/bin/hysteria
     ) || { return 1; }
-    ok "hysteria 安装完成"
+    ok "Hysteria 2 安装完成"
   fi
 
+  # 3. 准备配置目录和证书
   mkdir -p /etc/hysteria2
+  local cert_file="/etc/hysteria2/${port}.crt"
+  local key_file="/etc/hysteria2/${port}.key"
+  local sni_domain="www.bing.com"
 
-  generate_self_signed_cert "/etc/hysteria2/${port}.key" "/etc/hysteria2/${port}.crt" "$domain" || { err "自签证书生成失败"; return 1; }
+  say "正在生成自签名证书 ($sni_domain)..."
+  openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$key_file" -out "$cert_file" -days 3650 -subj "/CN=$sni_domain" >/dev/null 2>&1
+  chmod 644 "$cert_file" "$key_file"
 
-  local auth_pwd obfs_pwd
-  auth_pwd=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
-  obfs_pwd=$(openssl rand -base64 8 | tr -d '=+/' | cut -c1-8)
+  # 4. 生成随机密码
+  local auth_pwd=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
+  local obfs_pwd=$(openssl rand -base64 8 | tr -d '=+/' | cut -c1-8)
 
-  local tag="hysteria2-$(get_country_code)-$(tr -dc 'A-Z' </dev/urandom | head -c1)"
-  if jq -e --arg t "$tag" '.inbounds[] | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1 || jq -e --arg t "$tag" 'has($t)' "$META" >/dev/null 2>&1; then
-    tag="hysteria2-$(get_country_code)-$(date +%s)"
-  fi
+  # 5. 生成配置文件
+  cat > "/etc/hysteria2/${port}.yaml" <<EOF
+listen: :${port}
 
-  cat > /etc/hysteria2/${port}.yaml <<EOF
-listen: ":${port}"
 tls:
-  cert: /etc/hysteria2/${port}.crt
-  key: /etc/hysteria2/${port}.key
+  cert: ${cert_file}
+  key: ${key_file}
+
+auth:
+  type: password
+  password: ${auth_pwd}
+
 obfs:
   type: salamander
   salamander:
     password: ${obfs_pwd}
-auth:
-  type: password
-  password: ${auth_pwd}
+
 masquerade:
   type: proxy
   proxy:
-    url: https://${domain}
-    rewriteHost: true
+    url: https://${sni_domain}/
+    rewriteHost: true 
     insecure: true
+
+ignoreClientBandwidth: false
 EOF
 
-  cat > /etc/systemd/system/hysteria2-${port}.service <<EOF
+  # 6. 配置 Systemd 服务
+  local service_name="hysteria2-${port}"
+  cat > "/etc/systemd/system/${service_name}.service" <<EOF
 [Unit]
-Description=Hysteria2 Service (${port})
+Description=Hysteria2 Service (Port ${port})
 After=network-online.target
 Wants=network-online.target
 
@@ -1828,33 +1886,48 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria2/${port}.yaml
 Restart=always
-RestartSec=3s
+RestartSec=3
 LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload >/dev/null 2>&1 || log_msg "WARN" "daemon-reload failed"
-  systemctl enable hysteria2-${port}.service >/dev/null 2>&1 || log_msg "WARN" "enable hysteria2-${port} failed"
-  systemctl restart hysteria2-${port}.service >/dev/null 2>&1 || log_msg "WARN" "restart hysteria2-${port} failed"
+  # 7. 启动服务
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable "$service_name" >/dev/null 2>&1
+  systemctl restart "$service_name" >/dev/null 2>&1
+  
+  sleep 2
+  if ! systemctl is-active --quiet "$service_name"; then
+      err "Hysteria2 服务启动失败，请检查日志: journalctl -u $service_name"
+      return 1
+  fi
 
-  sleep 1
-  if systemctl is-active --quiet hysteria2-${port}; then ok "Hysteria2 服务已启动"
-  else err "Hysteria2 服务启动失败，请检查日志 (journalctl -u hysteria2-${port})"; return 1; fi
-
+  # 8. 更新 Meta 数据
+  local tag="Hy2-Default-$(date +%s)"
   local tmpmeta; tmpmeta=$(mktemp)
   trap 'rm -f "$tmpmeta"' EXIT
-  jq --arg tag "$tag" --arg port "$port" --arg sni "$domain" --arg obfs "$obfs_pwd" --arg auth "$auth_pwd" \
+  
+  if [[ ! -f "$META" ]]; then echo "{}" > "$META"; fi
+  jq --arg tag "$tag" --arg port "$port" --arg sni "$sni_domain" --arg obfs "$obfs_pwd" --arg auth "$auth_pwd" \
     '. + {($tag): {type:"hysteria2", port:$port, sni:$sni, obfs:$obfs, auth:$auth}}' "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
 
-  # --- 样式优化 ---
-  local link="hysteria2://${auth_pwd}@${GLOBAL_IPV4}:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${domain}&insecure=1#${tag}"
-  local info="本地端口: ${C_CYAN}${port}${C_RESET}\nAuth密码: ${C_CYAN}${auth_pwd}${C_RESET}\nObfs密码: ${C_CYAN}${obfs_pwd}${C_RESET}"
-  print_card "Hysteria2 搭建成功" "$tag" "$info" "$link"
-  [[ -n "$GLOBAL_IPV6" ]] && echo -e "IPv6 链接: hysteria2://${auth_pwd}@[${GLOBAL_IPV6}]:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${domain}&insecure=1#${tag}"
-  echo ""
+  # 9. 输出节点链接
+  local link="hysteria2://${auth_pwd}@${GLOBAL_IPV4}:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${sni_domain}&insecure=1#${tag}"
+  local info="本地端口: ${C_CYAN}${port}${C_RESET}\nAuth密码: ${C_CYAN}${auth_pwd}${C_RESET}\nObfs密码: ${C_CYAN}${obfs_pwd}${C_RESET}\n模式: ${C_CYAN}自签证书(bing.com)${C_RESET}"
+  
+  print_card "Hysteria2 部署成功" "$tag" "$info" "$link"
+  
+  if [[ -n "$GLOBAL_IPV6" ]]; then
+      local link_v6="hysteria2://${auth_pwd}@[${GLOBAL_IPV6}]:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${sni_domain}&insecure=1#${tag}"
+      echo -e "IPv6 链接: ${C_YELLOW}${link_v6}${C_RESET}"
+      echo ""
+  fi
+  
+  read -rp "按回车返回主菜单..." _
 }
+
 # ===== 3. 在脚本任意位置（建议放在 add_hysteria2_node 之后）新增这个完整函数 =====
 import_argo_nodes() {
     local imported=0
@@ -1893,7 +1966,6 @@ view_nodes() {
   set +e
 
   local total ext_count
-  # 仅在需要普通节点时读取 config 和 meta
   if [[ "$filter_mode" == "normal" ]]; then
     total=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo "0")
     ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null || echo "0")
@@ -1977,8 +2049,32 @@ view_nodes() {
   echo -e "${C_GREEN}序号  协议        端口         名称${C_RESET}"
   echo "---------------------------------------------------------"
 
-  local i=0
-  while (( i < idx )); do
+  # --- 新增排序逻辑 ---
+  local -a sort_map
+  local k
+  for ((k=0; k<idx; k++)); do
+    # 提取端口开头的数字用于排序，如果不是数字则赋大值(999999)放在最后
+    local p_str="${node_ports[$k]}"
+    local p_val
+    if [[ "$p_str" =~ ^[0-9]+ ]]; then
+      p_val="${BASH_REMATCH[0]}"
+    else
+      p_val=999999
+    fi
+    # 格式：端口数字:原始索引
+    sort_map+=("$p_val:$k")
+  done
+
+  # 按数字进行排序
+  local -a sorted_indices
+  IFS=$'\n' sorted_indices=($(sort -n <<<"${sort_map[*]}"))
+  unset IFS
+  # -------------------
+
+  local display_seq=1
+  for item in "${sorted_indices[@]}"; do
+    local i="${item#*:}" # 获取原始索引
+
     local tag="${node_tags[$i]}"
     local port="${node_ports[$i]}"
     local type="${node_types[$i]}"
@@ -1991,17 +2087,13 @@ view_nodes() {
     else
       case "$type" in
         vless)
-          # === 修复部分开始 ===
-          # 优先从 config.json 读取 UUID，因为 META 文件通常不存 UUID
           local uuid=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid // empty' "$CONFIG")
-          
           local pbk=$(jq -r --arg t "$tag" '.[$t].pbk // empty' "$META")
           local sid=$(jq -r --arg t "$tag" '.[$t].sid // empty' "$META")
           local sni=$(jq -r --arg t "$tag" '.[$t].sni // "www.cloudflare.com"' "$META")
           local fp=$(jq -r --arg t "$tag" '.[$t].fp // "chrome"' "$META")
           
           [[ -n "$uuid" && -n "$pbk" ]] && display_link="vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=${fp}#${tag}"
-          # === 修复部分结束 ===
           ;;
         socks)
           local info=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | "\(.users[0].username):\(.users[0].password)"' "$CONFIG")
@@ -2027,15 +2119,16 @@ view_nodes() {
     
     # 3. 紧凑输出
     printf "[%2d] ${C_GREEN}%-10s${C_RESET} | ${C_CYAN}%-10s${C_RESET} | ${C_CYAN}%s${C_RESET} %s\n" \
-           "$((i+1))" "${type^^}" "${port}" "${tag}" "${status_mark}"
+           "$display_seq" "${type^^}" "${port}" "${tag}" "${status_mark}"
     
     echo -e "     ${C_YELLOW}${display_link}${C_RESET}"
     echo -e "${C_RESET}---------------------------------------------------------${C_RESET}"
     
-    ((i++))
+    ((display_seq++))
   done
   set -e
 }
+
 view_nodes_menu() {
   while true; do
     say ""
@@ -2255,7 +2348,13 @@ main_menu() {
   say "5) NAT 模式设置"
   say "0) 退出"
   say "==============================================================="
-  read -rp "请输入操作编号: " choice
+  # 在 main_menu 函数内找到 read 命令
+read -rp "请输入操作编号: " choice
+if [ $? -ne 0 ]; then
+    echo "无法读取输入，脚本退出。"
+    exit 1
+fi
+
   case "$choice" in
     1) add_node ;;
     2) view_nodes_menu ;;  # <--- 这里修改为调用新菜单
@@ -2319,6 +2418,6 @@ if [ ! -t 0 ] || [ "$AUTO_DAEMON" = "1" ]; then
     tail -f /var/log/sing-box.log
 else
     # 只有你手动 bash sk5.sh 或者 sh sk5.sh 时才进入交互菜单
-    while true; do main_menu; done
+    while true; do main_menu || break; done
 fi
 # =====================================================================
