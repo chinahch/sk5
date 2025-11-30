@@ -724,7 +724,8 @@ if ! "$BIN" check -c "$CONFIG" >/dev/null 2>&1; then
   exit 1
 fi
 
-setsid bash -lc "$CMD" >>"$LOG" 2>&1 </dev/null &
+# 去掉 -l 参数，防止读取 .bashrc/.profile
+setsid bash -c "$CMD" >>"$LOG" 2>&1 </dev/null &
 echo $! > "$PIDFILE"
 exit 0
 WRAP
@@ -764,15 +765,6 @@ EOL
     done
   fi
 
-  # 3. 添加 Cron 看门狗 (@reboot + 每分钟)，作为双重保险
-  if command -v crontab >/dev/null 2>&1; then
-    local marker="# sing-box-watchdog"
-    crontab -l 2>/dev/null | grep -v "$marker" > /tmp/crontab.tmp 2>/dev/null || true
-    echo "* * * * * /usr/local/bin/sb-singleton >/dev/null 2>&1  $marker" >> /tmp/crontab.tmp
-    echo "@reboot /usr/local/bin/sb-singleton >/dev/null 2>&1  $marker" >> /tmp/crontab.tmp
-    crontab /tmp/crontab.tmp
-    rm -f /tmp/crontab.tmp
-  fi
 }
 
 start_singbox_legacy_nohup() {
@@ -2349,9 +2341,12 @@ main_menu() {
   say "0) 退出"
   say "==============================================================="
   # 在 main_menu 函数内找到 read 命令
-read -rp "请输入操作编号: " choice
-if [ $? -ne 0 ]; then
-    echo "无法读取输入，脚本退出。"
+# 原代码：
+# read -rp "请输入操作编号: " choice
+
+# 修改为：
+if ! read -rp "请输入操作编号: " choice; then
+    echo "无法读取输入（可能是后台运行或连接断开），脚本退出。"
     exit 1
 fi
 
