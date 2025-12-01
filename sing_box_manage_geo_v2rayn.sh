@@ -2332,7 +2332,7 @@ script_services_menu() {
 main_menu() {
   say ""
   show_version_info
-  say "============= 嘻嘻哈哈 节点管理工具（IPv4 + IPv6） ============="
+  say "=============  节点管理工具（IPv4 + IPv6） ============="
   say "1) 添加节点"
   say "2) 查看节点 (分类查看)"  # 修改了描述
   say "3) 删除节点"
