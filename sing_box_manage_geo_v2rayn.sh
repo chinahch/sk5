@@ -1204,7 +1204,36 @@ fix_errors() {
   done
   shopt -u nullglob
 }
+# ============= 自动 CPU 优化 (无菜单静默版) =============
+auto_optimize_cpu() {
+  # 1. 尝试安装 renice (如果系统里没有)
+  if ! command -v renice >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then 
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get -yq update >/dev/null 2>&1 && apt-get -yq install bsdutils >/dev/null 2>&1 || apt-get -yq install util-linux >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then 
+      apk add --no-cache util-linux >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then 
+      yum -y -q install util-linux >/dev/null 2>&1
+    fi
+  fi
 
+  # 2. 获取 Sing-box PID 并调整优先级
+  local sb_pid
+  sb_pid=$(pgrep -x sing-box | head -n1)
+  
+  if [[ -n "$sb_pid" ]]; then
+     # 设置为 -10 (高优先级，范围是 -20 到 19，越小越优先)
+     # 这样可以防止 CPU 占用高时节点断流
+     if command -v renice >/dev/null 2>&1; then
+        renice -n -10 -p "$sb_pid" >/dev/null 2>&1
+        # 如果是手动运行脚本，提示一下；如果是后台自动运行，则静默
+        if [ -t 1 ]; then 
+           echo " [自动优化] "
+        fi
+     fi
+  fi
+}
 restart_singbox() {
   local bin; bin="$(_sb_bin)"
   local cfg; cfg="$(_sb_cfg)"
@@ -1243,7 +1272,7 @@ restart_singbox() {
   install_singleton_wrapper
   install_autostart_fallback
   start_singbox_singleton_force
-
+  auto_optimize_cpu
   for i in $(seq 1 30); do
     _sb_any_port_listening && { ok "Sing-box 重启完成（fallback 后台）"; return 0; }
     sleep 0.5
@@ -2393,7 +2422,9 @@ esac
 GLOBAL_IPV4=$(curl -s --max-time 2 https://api.ipify.org || echo "<服务器IP>")
 GLOBAL_IPV6=$(get_ipv6_address)
 load_nat_data
-
+# === 在这里插入，脚本启动时自动执行优化 ===
+auto_optimize_cpu
+# ======================================
 trap on_int_menu_quit_only INT
 
 # ==================== 关键补丁：纯容器环境强制守护 ====================
