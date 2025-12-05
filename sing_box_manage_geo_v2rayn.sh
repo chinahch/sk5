@@ -2252,7 +2252,6 @@ script_services_menu() {
   esac
   done
 }
-
 main_menu() {
   say ""
   show_version_info
@@ -2264,10 +2263,26 @@ main_menu() {
   say "5) NAT 模式设置"
   say "0) 退出"
   say "==============================================================="
+  say "（提示：脚本将在 15 秒无操作后自动退出）" # <--- 新增提示
 
-  if ! read -rp "请输入操作编号: " choice; then
-      echo "无法读取输入（可能是后台运行或连接断开），脚本退出。"
-      exit 1
+  # 使用 read -t 15 设置 15 秒超时
+  if ! read -t 15 -rp "请输入操作编号: " choice; then
+      local rc=$?
+      if [ $rc -eq 1 ]; then # 无法读取输入 (非交互式或连接断开)
+          echo "无法读取输入（非交互式模式），脚本退出。"
+          exit 1
+      elif [ $rc -eq 128 ]; then # 超时 (exit code 128 + signal number, 理论上是 128+1)
+          echo ""
+          say "超过 15 秒未操作，自动退出。"
+          exit 0 # 自动退出
+      fi
+  fi
+
+  # 如果 choice 为空 (用户直接按回车或超时但 Bash 版本处理不同)
+  if [[ -z "$choice" ]]; then
+      echo ""
+      say "输入为空或超时，自动退出。"
+      exit 0
   fi
 
   case "$choice" in
