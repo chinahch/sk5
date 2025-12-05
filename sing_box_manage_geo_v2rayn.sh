@@ -1,10 +1,34 @@
 #!/usr/bin/env bash
-# sk5.sh 融合 Misaka-blog Hysteria2 一键逻辑版
-# 修改内容：Hysteria2 部署改为全自动（随机端口/证书/密码），直接出节点
+# sk5.sh 融合 Misaka-blog Hysteria2 一键逻辑版 (性能优化版)
+# 优化内容：减少外部进程调用、缓存系统检测结果、降低轮询频率、内存手动回收
+
+export LC_ALL=C # 优化 grep/sed/awk 处理速度
 
 ARGO_TEMP_CACHE="/root/agsbx/jh.txt"
 ARGO_FIXED_CACHE="/root/agsbx/gd.txt"
 ARGO_META_TAG_PREFIX="Argo-"
+
+# --- 缓存系统信息，避免重复检测 ---
+_OS_CACHE=""
+_INIT_SYS_CACHE=""
+
+detect_os() {
+  if [[ -n "$_OS_CACHE" ]]; then echo "$_OS_CACHE"; return; fi
+  if [[ -f /etc/os-release ]]; then . /etc/os-release; _OS_CACHE="$ID"; else _OS_CACHE="unknown"; fi
+  echo "$_OS_CACHE"
+}
+
+detect_init_system() {
+  if [[ -n "$_INIT_SYS_CACHE" ]]; then echo "$_INIT_SYS_CACHE"; return; fi
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    _INIT_SYS_CACHE="systemd"
+  elif command -v rc-service >/dev/null 2>&1 && [[ -d /run/openrc ]]; then
+    _INIT_SYS_CACHE="openrc"
+  else
+    _INIT_SYS_CACHE="unknown"
+  fi
+  echo "$_INIT_SYS_CACHE"
+}
 
 on_int_menu_quit_only() {
   restart_singbox >/dev/null 2>&1
@@ -24,10 +48,8 @@ fi
 sb233_run_install_silent() {
   set -e
   # --- Sing-box 版本/架构探测（兼容 233 的 /etc/sing-box/bin） ---
-  # 让 233 的二进制优先被找到（不改变系统 PATH 的持久配置，仅对本进程生效）
   export PATH="/etc/sing-box/bin:$PATH"
 
-  # 找到 sing-box 的有效路径：优先显式变量、其次 233 路径、然后 PATH，最后从运行进程反查
   resolve_singbox_bin() {
     if [ -n "${SING_BOX_BIN:-}" ] && [ -x "$SING_BOX_BIN" ]; then
       echo "$SING_BOX_BIN"; return 0
@@ -43,7 +65,6 @@ sb233_run_install_silent() {
     [ -n "$pid" ] && readlink -f "/proc/$pid/exe" 2>/dev/null || true
   }
 
-  # 输出形如：Sing-box 版本: 1.12.0  | 架构: go1.24.5 linux/arm64
   probe_singbox_version_line() {
     local bin ver go arch out meta
     bin="$(resolve_singbox_bin)"
@@ -53,13 +74,8 @@ sb233_run_install_silent() {
     fi
 
     out="$("$bin" version 2>/dev/null || true)"
-
-    # 先尝试直接抓语义化版本
     ver="$(printf '%s\n' "$out" | grep -Eo '([0-9]+\.){1,3}[0-9]+' | head -n1)"
-    # 兜底：从 'sing-box version X' 这一行取第3列（避免 sed 的 \+ 兼容性）
     [ -z "$ver" ] && ver="$(printf '%s\n' "$out" | awk '/^sing-box[[:space:]]+version[[:space:]]+/ {print $3; exit}')"
-
-    # go 版本与平台
     go="$(printf '%s\n' "$out" | grep -Eo 'go[0-9]+(\.[0-9]+){1,2}' | head -n1)"
     arch="$(printf '%s\n' "$out" | grep -Eo '(linux|darwin|windows)/[a-z0-9_]+' | head -n1)"
 
@@ -68,26 +84,23 @@ sb233_run_install_silent() {
     else
       meta="未知"
     fi
-
     echo "Sing-box 版本: ${ver:-未知}  | 架构: ${meta}"
   }
 
   export DEBIAN_FRONTEND=noninteractive
   umask 022
 
-  SB_VER="${SB_VER:-}"  # 可选锁版本
+  SB_VER="${SB_VER:-}"
   FLAG_DONE="/etc/sing-box/.sb233_installed"
   FLAG_START="/etc/sing-box/.sb233_installing"
   LOG="/var/log/sb233.install.log"
   URL="https://github.com/233boy/sing-box/raw/main/install.sh"
 
-  # 已完成 -> 直接返回
   [[ -f "$FLAG_DONE" ]] && return 0
 
   mkdir -p /etc/sing-box /var/log || true
   : > "$LOG" || true
 
-  # 准备下载器（缺啥就静默装）
   if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     if command -v apt-get >/dev/null 2>&1; then
       apt-get -yq update >/dev/null 2>&1 || true
@@ -99,10 +112,8 @@ sb233_run_install_silent() {
 
   echo "(info) running 233 installer (blocking) ..." >>"$LOG"
   echo "(info) URL=$URL SB_VER=${SB_VER:-latest}" >>"$LOG"
-
   echo > "$FLAG_START"
 
-  # 前台静默执行，完成后打标记；失败返回非零
   set +e
   if command -v curl >/dev/null 2>&1; then
     if [ -n "$SB_VER" ]; then
@@ -130,15 +141,8 @@ sb233_run_install_silent() {
     return $rc
   fi
 }
-# sk5.sh — Sing-box 管理脚本（systemd/OpenRC 自适应）
-# 功能：依赖安装、sing-box 安装/自启动、添加/查看/删除节点、脚本服务（检测并修复/升级/重启/重装）、NAT 模式
-# 修复：
-# - 修正 jq 引号与 -s 用法，避免 “Unix shell quoting issues?”
-# - TCP/UDP 自定义端口分别存储 custom_tcp/custom_udp，互不覆盖；删除使用 index() 过滤
-# - 移除错误的自调用包装函数，避免递归
-# - 当端口池用尽时明确提示；自动选择端口必定输出数字
-# - 菜单与提示语符合你的中文文案
-# ============= 基础工具与变量定义（保持你原脚本头部不变） =============
+
+# ============= 基础工具与变量定义 =============
 umask 022
 C_RESET='\033[0m'
 C_GREEN='\033[32m'
@@ -169,7 +173,7 @@ CONFIG="/etc/sing-box/config.json"
 META="/etc/sing-box/nodes_meta.json"
 NAT_FILE="/etc/sing-box/nat_ports.json"
 LOG_FILE="/var/log/sing-box.log"
-DEPS_CHECKED=0  # 新增全局标志，避免重复依赖检查
+DEPS_CHECKED=0  # 全局标志
 
 say()  { printf "%s\n" "$*"; }
 err()  { printf " %s\n" "$*" >&2; }
@@ -181,19 +185,8 @@ log_msg() {
 }
 
 # ============= 基础工具 =============
-detect_os() {
-  if [[ -f /etc/os-release ]]; then . /etc/os-release; echo "$ID"; else echo "unknown"; fi
-}
-
-detect_init_system() {
-  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-    echo systemd; return
-  fi
-  if command -v rc-service >/dev/null 2>&1 && [[ -d /run/openrc ]]; then
-    echo openrc; return
-  fi
-  echo unknown
-}
+# detect_os 已移至头部
+# detect_init_system 已移至头部
 
 is_real_systemd() {
   [[ -d /run/systemd/system ]] && ps -p 1 -o comm= 2>/dev/null | grep -q '^systemd$'
@@ -203,7 +196,6 @@ is_pseudo_systemd() {
   ps -p 1 -o comm,args= 2>/dev/null | grep -q 'systemctl' && ! is_real_systemd
 }
 
-# 工具函数：获取 sing-box 二进制路径/配置路径
 _sb_bin() {
   local b="${SING_BOX_BIN:-/usr/local/bin/sing-box}"
   [[ -x "$b" ]] || b="/etc/sing-box/bin/sing-box"
@@ -212,15 +204,19 @@ _sb_bin() {
 }
 _sb_cfg() { printf "%s" "${CONFIG:-/etc/sing-box/config.json}"; }
 
-# 任一入站端口开始监听即视为 OK（检测 TCP 监听）
 _sb_any_port_listening() {
   local cfg="$(_sb_cfg)"
   [[ -s "$cfg" ]] || return 1
+  # 优化：一次性获取 ss 输出
+  local ss_out
+  ss_out=$(ss -ltnp 2>/dev/null)
+  
   local any=""
   while read -r p; do
     [[ -z "$p" ]] && continue
-    if ss -ltnp 2>/dev/null | grep -q ":$p "; then any=1; break; fi
-    timeout 1 bash -lc "echo >/dev/tcp/127.0.0.1/$p" >/dev/null 2>&1 && { any=1; break; }
+    if echo "$ss_out" | grep -q ":$p "; then any=1; break; fi
+    # 减少 timeout bash 调用，仅作为 fallback
+    # timeout 1 bash -lc "echo >/dev/tcp/127.0.0.1/$p" >/dev/null 2>&1 && { any=1; break; }
   done < <(jq -r '.inbounds[].listen_port' "$cfg" 2>/dev/null)
   [[ -n "$any" ]]
 }
@@ -265,6 +261,8 @@ install_deps() {
 }
 
 install_dependencies() {
+  if (( DEPS_CHECKED == 1 )); then return 0; fi # 避免重复检查
+
   local need=()
   command -v curl >/dev/null 2>&1    || need+=("curl")
   command -v jq >/dev/null 2>&1      || need+=("jq")
@@ -273,6 +271,7 @@ install_dependencies() {
   command -v ss >/dev/null 2>&1      || need+=("iproute2")
   command -v lsof >/dev/null 2>&1    || need+=("lsof")
   command -v bash >/dev/null 2>&1    || need+=("bash")
+  
   if ((${#need[@]})); then
     case "$(detect_os)" in
       debian|ubuntu)
@@ -292,12 +291,11 @@ install_dependencies() {
       *) warn "未识别系统，请确保安装：${need[*]}" ;;
     esac
   fi
+  DEPS_CHECKED=1
   ok "依赖已满足（curl/jq/uuidgen/openssl/iproute2/lsof）"
 }
 
-# —— 新增：逐项确保指定命令可用（按不同发行版安装对应包）——
 ensure_cmd() {
-  # 用法：ensure_cmd <command> <debian_pkg> <alpine_pkg> <centos_pkg> <fedora_pkg>
   local cmd="$1" deb="$2" alp="$3" cen="$4" fed="$5"
   command -v "$cmd" >/dev/null 2>&1 && return 0
   case "$(detect_os)" in
@@ -314,18 +312,18 @@ ensure_cmd() {
   esac
   command -v "$cmd" >/dev/null 2>&1
 }
-# —— 新增：在需要用到前“兜底安装”关键依赖（多次调用无副作用）——
+
 ensure_runtime_deps() {
-  # curl / jq / uuidgen / openssl / ss / lsof
+  if (( DEPS_CHECKED == 1 )); then return 0; fi
   ensure_cmd curl     curl        curl        curl        curl
   ensure_cmd jq       jq          jq          jq          jq
-  # uuidgen 在 Debian/Ubuntu 提供于 uuid-runtime；在 Alpine 是 util-linux
   ensure_cmd uuidgen  uuid-runtime util-linux util-linux  util-linux
   ensure_cmd openssl  openssl      openssl     openssl     openssl
-  # ss 在 Debian/Ubuntu 来自 iproute2；Alpine 也叫 iproute2
   ensure_cmd ss       iproute2     iproute2    iproute    iproute
   ensure_cmd lsof     lsof         lsof        lsof        lsof
+  DEPS_CHECKED=1
 }
+
 install_singbox_if_needed() {
   if command -v sing-box >/dev/null 2>&1; then return 0; fi
 
@@ -379,7 +377,6 @@ install_singbox_if_needed() {
   ok "sing-box 安装完成"
 }
 
-# 地理信息（失败则 ZZ）
 get_country_code() {
   local CODE
   CODE=$(curl -s --max-time 3 https://ipinfo.io | jq -r '.country // empty')
@@ -406,21 +403,29 @@ generate_unique_tag() {
   done
 }
 
-# ============= 端口占用检查（TCP监听） =============
+# ============= 端口占用检查（TCP监听）优化版 =============
 port_status() {
   local port="$1"
   local have=0 seen_s=0 seen_o=0
+  
+  # 优化：一次性获取所有监听端口，减少进程创建
+  local ss_output=""
   if command -v ss >/dev/null 2>&1; then
     have=1
-    local t=$(ss -ltnp "sport = :$port" 2>/dev/null || true)
-    if grep -q LISTEN <<<"$t"; then
-      if grep -Eqi 'users:\(\(".*sing-box' <<<"$t"; then seen_s=1; else seen_o=1; fi
-    fi
-    local u=$(ss -lunp "sport = :$port" 2>/dev/null || true)
-    if grep -Eqi 'users:\(\(".*' <<<"$u"; then
-      if grep -Eqi 'users:\(\(".*sing-box' <<<"$u"; then seen_s=1; else seen_o=1; fi
+    ss_output=$(ss -luntp 2>/dev/null || true)
+    
+    # Check TCP
+    if echo "$ss_output" | grep -q ":$port "; then
+       # 检查是否是 sing-box
+       if echo "$ss_output" | grep ":$port " | grep -qi 'users:((".*sing-box'; then
+          seen_s=1
+       else
+          seen_o=1
+       fi
     fi
   fi
+  
+  # Fallback to lsof if ss not available or failed (unlikely)
   if (( have==0 )) && command -v lsof >/dev/null 2>&1; then
     have=1
     local names=""
@@ -430,10 +435,10 @@ port_status() {
       if echo "$names" | grep -Eqi 'sing-box'; then seen_s=1; else seen_o=1; fi
     fi
   fi
+  
   if (( seen_s==1 )); then return 0; elif (( seen_o==1 )); then return 1; else return 2; fi
 }
 
-# 预加载 NAT 数据
 load_nat_data() {
   if [[ -f "$NAT_FILE" ]]; then
     nat_mode=$(jq -r '.mode // "custom"' "$NAT_FILE")
@@ -510,7 +515,6 @@ check_nat_allow() {
   fi
 }
 
-# 生成自签证书函数
 generate_self_signed_cert() {
   local key_file="$1" cert_file="$2" domain="$3"
   umask 077
@@ -521,7 +525,6 @@ generate_self_signed_cert() {
   if [[ -f "$cert_file" && -f "$key_file" ]]; then return 0; else return 1; fi
 }
 
-# ============= systemd/OpenRC =============
 ensure_service_openrc() {
   cat <<'EOF' >/etc/init.d/sing-box
 #!/sbin/openrc-run
@@ -557,7 +560,6 @@ kill_rogue_singbox() {
   done
 }
 
-# 合并：系统检测与修复（给出建议并可一键执行）
 check_and_repair_menu() {
   say "====== 系统检测与修复（合并） ======"
   system_check
@@ -591,10 +593,10 @@ check_and_repair_menu() {
     fi
   fi
 
-  # 等待用户确认后返回上一层菜单（不退出脚本）
   read -rp "修复完成，按回车返回脚本服务菜单..." _
   return
 }
+
 install_systemd_service() {
   local SERVICE_FILE="/etc/systemd/system/sing-box.service"
   mkdir -p /etc/systemd/system
@@ -624,7 +626,7 @@ EOF
   for i in $(seq 1 20); do
     systemctl is-active --quiet sing-box && { okflag=1; break; }
     _sb_any_port_listening && { okflag=1; break; }
-    sleep 0.5
+    sleep 1 # 优化：降低轮询频率
   done
   if (( okflag==1 )); then ok "已安装并启用 systemd 自启动服务：sing-box"; return 0; fi
 
@@ -635,14 +637,13 @@ EOF
 
   for i in $(seq 1 20); do
     _sb_any_port_listening && { ok "fallback 已启动 sing-box（后台）"; return 0; }
-    sleep 0.5
+    sleep 1
   done
   err "fallback 启动失败，请检查 $LOG_FILE"
   return 1
 }
 
 choose_start_mode() {
-  # Allow override: START_MODE=legacy|singleton
   if [[ -n "${START_MODE:-}" ]]; then echo "$START_MODE"; return; fi
   if is_pseudo_systemd; then echo "legacy"; else echo "singleton"; fi
 }
@@ -724,7 +725,6 @@ if ! "$BIN" check -c "$CONFIG" >/dev/null 2>&1; then
   exit 1
 fi
 
-# 去掉 -l 参数，防止读取 .bashrc/.profile
 setsid bash -c "$CMD" >>"$LOG" 2>&1 </dev/null &
 echo $! > "$PIDFILE"
 exit 0
@@ -733,7 +733,6 @@ WRAP
 }
 
 install_autostart_fallback() {
-  # 1. 尝试标准的 Alpine OpenRC 配置 (针对有 init 的容器)
   if [[ -f /etc/alpine-release ]]; then
     mkdir -p /etc/local.d
     cat > /etc/local.d/sb-singbox.start <<'EOL'
@@ -741,21 +740,14 @@ install_autostart_fallback() {
 /usr/local/bin/sb-singleton >> /var/log/sing-box.log 2>&1 &
 EOL
     chmod +x /etc/local.d/sb-singbox.start
-    # 尝试添加到 OpenRC，失败也不报错，继续下面的 Profile 注入
     rc-update add local default >/dev/null 2>&1 || true
   else
-    # 其他系统：尝试 rc.local
     ensure_rc_local_template
   fi
 
-  # 2. 关键修复：针对 Docker 环境的 Profile 注入
-  # 大多数 Docker 容器启动时会加载 /etc/profile 或 ~/.profile
   if is_docker || [[ -f /.dockerenv ]]; then
     local start_cmd="/usr/local/bin/sb-singleton >> /var/log/sing-box.log 2>&1 &"
-    
-    # 遍历常见的 profile 文件
     for profile in /etc/profile /root/.profile /root/.bashrc /root/.ashrc; do
-      # 如果文件存在，且里面没有写过启动命令
       if [[ -f "$profile" ]] && ! grep -q "sb-singleton" "$profile"; then
         echo "" >> "$profile"
         echo "# Sing-box Autostart (Docker Fix)" >> "$profile"
@@ -764,11 +756,9 @@ EOL
       fi
     done
   fi
-
 }
 
 start_singbox_legacy_nohup() {
-  # 使用 setsid 脱离前台会话，避免 Ctrl+C 影响
   if command -v /usr/local/bin/sb-singleton >/dev/null 2>&1; then
     daemonize /usr/local/bin/sb-singleton --force
   else
@@ -782,21 +772,18 @@ start_singbox_singleton_force() {
   daemonize /usr/local/bin/sb-singleton --force
 }
 
-# ============= NAT 规则存取/校验（清爽展示 + 左右分栏菜单） =============
 view_nat_ports() {
   if [[ ! -f "$NAT_FILE" ]]; then
     warn "当前未设置 NAT 模式规则"
     return
   fi
 
-  # 颜色（终端支持时启用）
   local BOLD="" C_END="" C_CYAN="" C_GRN="" C_YLW=""
   if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ $(tput colors 2>/dev/null) -ge 8 ]]; then
     BOLD=$'\033[1m'; C_END=$'\033[0m'
     C_CYAN=$'\033[36m'; C_GRN=$'\033[32m'; C_YLW=$'\033[33m'
   fi
 
-  # 网格打印（用 * 指定宽度，避免把变量拼进格式串）
   _print_grid() {
     local cols="$1" cellw="$2"; shift 2
     local i=0 item
@@ -809,10 +796,8 @@ view_nat_ports() {
   }
 
   local mode; mode="$nat_mode"
-  # 分拆打印，彻底规避选项误判
   printf "%s" "$BOLD"; printf "%s" "当前 NAT 模式:"; printf "%s" "$C_END"; printf " %s\n\n" "$mode"
 
-  # 使用预加载数据
   if ((${#nat_ranges[@]})); then
     printf "%s%s范围端口:%s\n" "$BOLD" "$C_CYAN" "$C_END"
     _print_grid 4 13 "${nat_ranges[@]}"
@@ -829,7 +814,6 @@ view_nat_ports() {
     _print_grid 8 6 "${nat_udp[@]}"; printf "\n"
   fi
 
-  # 菜单（同样用 * 指定宽度）
   local w_left=34
   printf '%s\n' "------ 端口规则管理 ------"
   printf "%-*s %s\n" "$w_left" "1) 添加范围端口"                      "2) 删除范围端口"
@@ -848,7 +832,7 @@ view_nat_ports() {
       jq --argjson arr "$(printf '%s\n' "$ranges_in" | jq -R 'split(" ")')" \
          '.mode="range"|.ranges=((.ranges//[])+$arr)|.custom_tcp=(.custom_tcp//[])|.custom_udp=(.custom_udp//[])' \
          "$NAT_FILE" >"$tmp" && mv "$tmp" "$NAT_FILE"
-      load_nat_data  # 重新加载 NAT 数据
+      load_nat_data
       ok "已添加范围段"
       ;;
     2)
@@ -968,7 +952,6 @@ nat_mode_menu() {
   esac
 }
 
-# ============= 升级/重装/系统检测与修复 =============
 update_singbox() {
   say " 正在检查 Sing-box 更新..."
   local CUR LATEST ARCH tmp
@@ -996,7 +979,6 @@ update_singbox() {
   ) || { err "升级失败"; return 1; }
   ok "已成功升级为 v${LATEST}"
 
-  # 统一保证更新后重启服务，避免失效
   say " 正在重启 Sing-box 服务以确保新版本生效..."
   if ! restart_singbox; then
     warn "自动重启失败，请在“脚本服务”中手动选择 2) 重启 Sing-box 服务。"
@@ -1014,9 +996,7 @@ reinstall_menu() {
       read -rp "确认继续 (y/N): " confirm
       [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
-      # --- 1. 停止服务与进程 (兼容所有系统) ---
       say "正在停止服务..."
-      # 尝试 systemd
       if command -v systemctl >/dev/null 2>&1; then
         systemctl disable --now sing-box >/dev/null 2>&1 || true
         shopt -s nullglob
@@ -1025,54 +1005,44 @@ reinstall_menu() {
         done
         shopt -u nullglob
       fi
-      # 尝试 OpenRC
       if command -v rc-service >/dev/null 2>&1; then
         rc-service sing-box stop >/dev/null 2>&1 || true
         rc-update del sing-box default >/dev/null 2>&1 || true
       fi
       
-      # 强制查杀残留进程 (防止容器内僵尸进程)
       pkill -9 -x sing-box >/dev/null 2>&1 || true
       pkill -9 -x hysteria >/dev/null 2>&1 || true
       pkill -9 -f "sb-singleton" >/dev/null 2>&1 || true
       pkill -9 -f "cloudflared" >/dev/null 2>&1 || true
       pkill -9 -f "xray" >/dev/null 2>&1 || true
 
-      # --- 2. 清理文件 ---
       say "正在清理文件..."
-      # Systemd 文件
       rm -f /etc/systemd/system/sing-box.service
       rm -f /lib/systemd/system/sing-box.service
       rm -f /etc/systemd/system/hysteria2*.service
       rm -f /lib/systemd/system/hysteria2*.service
       [ -n "$(command -v systemctl)" ] && systemctl daemon-reload >/dev/null 2>&1 || true
 
-      # OpenRC 文件
       rm -f /etc/init.d/sing-box
       rm -f /etc/local.d/sb-singbox.start
 
-      # 二进制与配置
       rm -f /usr/local/bin/sing-box /usr/bin/sing-box
       rm -f /usr/local/bin/hysteria /usr/bin/hysteria
       rm -f /usr/local/bin/sb-singleton
       rm -rf /etc/sing-box /var/lib/sing-box /var/log/sing-box* /tmp/sing-box*
       rm -rf /etc/hysteria2 /var/lib/hysteria2 /var/log/hysteria2* /tmp/hysteria2*
-      rm -rf /root/agsbx  # Argo 相关目录
+      rm -rf /root/agsbx
       rm -f "$META" "$NAT_FILE"
       
-      # --- 3. 清理自启残留 (Cron/rc.local/Profile) ---
       say "正在清理自启配置..."
-      # 清理 Crontab
       if command -v crontab >/dev/null 2>&1; then
         crontab -l 2>/dev/null | grep -v "sb-singleton" | grep -v "agsbx" | crontab - >/dev/null 2>&1 || true
       fi
       
-      # 清理 rc.local
       if [ -f /etc/rc.local ]; then
         sed -i '/sb-singleton/d' /etc/rc.local
       fi
       
-      # 清理 profile (Docker 修复残留)
       for profile in /etc/profile /root/.profile /root/.bashrc /root/.ashrc; do
         if [ -f "$profile" ]; then
            sed -i '/sb-singleton/d' "$profile"
@@ -1081,8 +1051,6 @@ reinstall_menu() {
       done
 
       say " Sing-box、Hysteria2 及 Argo 已完全卸载"
-
-      # 删除当前脚本文件
       SCRIPT_PATH="$(realpath "$0")"
       rm -f "$SCRIPT_PATH"
 
@@ -1094,7 +1062,6 @@ reinstall_menu() {
       echo " 正在重新安装 Sing-box（保留节点配置）..."
       bash <(curl -fsSL https://sing-box.app/install.sh)
       echo " Sing-box 已重新安装完成（节点已保留）"
-    # 重新安装后，确保服务被正确安装并重启
       case "$(detect_init_system)" in
         systemd) install_systemd_service ;;
         openrc)  ensure_service_openrc ;;
@@ -1108,14 +1075,12 @@ reinstall_menu() {
       ;;
     0) return ;;
     *) echo "无效选择" ;;
-  
   esac
 }
 
 
 system_check() {
   local issues=0
-
   if command -v sing-box >/dev/null 2>&1; then ok "sing-box 已安装"; else err "sing-box 未安装"; issues=1; fi
   local init; init=$(detect_init_system)
   if [[ "$init" == "systemd" ]]; then
@@ -1204,9 +1169,8 @@ fix_errors() {
   done
   shopt -u nullglob
 }
-# ============= 自动 CPU 优化 (无菜单静默版) =============
+
 auto_optimize_cpu() {
-  # 1. 尝试安装 renice (如果系统里没有)
   if ! command -v renice >/dev/null 2>&1; then
     if command -v apt-get >/dev/null 2>&1; then 
       export DEBIAN_FRONTEND=noninteractive
@@ -1218,22 +1182,20 @@ auto_optimize_cpu() {
     fi
   fi
 
-  # 2. 获取 Sing-box PID 并调整优先级
   local sb_pid
   sb_pid=$(pgrep -x sing-box | head -n1)
   
-  if [[ -n "$sb_pid" ]]; then
-     # 设置为 -10 (高优先级，范围是 -20 到 19，越小越优先)
-     # 这样可以防止 CPU 占用高时节点断流
-     if command -v renice >/dev/null 2>&1; then
-        renice -n -10 -p "$sb_pid" >/dev/null 2>&1
-        # 如果是手动运行脚本，提示一下；如果是后台自动运行，则静默
-        if [ -t 1 ]; then 
-           echo " [自动优化] "
-        fi
-     fi
+  if [[ -n "$sb_pid" ]] && command -v renice >/dev/null 2>&1; then
+     renice -n -10 -p "$sb_pid" >/dev/null 2>&1
+     if [ -t 1 ]; then echo " [自动优化] "; fi
+  fi
+  
+  # 额外优化：如果脚本在 Docker 中作为守护进程运行，降低自身优先级
+  if is_docker || [[ -f /.dockerenv ]]; then
+    renice -n 10 -p $$ >/dev/null 2>&1 || true
   fi
 }
+
 restart_singbox() {
   local bin; bin="$(_sb_bin)"
   local cfg; cfg="$(_sb_cfg)"
@@ -1250,18 +1212,17 @@ restart_singbox() {
     for i in $(seq 1 30); do
       systemctl is-active --quiet sing-box && { okflag=1; break; }
       _sb_any_port_listening && { okflag=1; break; }
-      sleep 0.5
+      sleep 1
     done
     if (( okflag==1 )); then ok "Sing-box 重启完成（systemd）"; return 0; fi
     warn "当前环境虽有 systemctl，但重启失败；切换 fallback 后台运行"
   elif command -v rc-service >/dev/null 2>&1 && [[ -f /etc/init.d/sing-box ]]; then
-    # OpenRC 环境：使用 rc-service 重启
     rc-service sing-box restart >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || log_msg "WARN" "rc-service failed"
     local okflag=0
     for i in $(seq 1 30); do
       rc-service sing-box status 2>/dev/null | grep -q started && { okflag=1; break; }
       _sb_any_port_listening && { okflag=1; break; }
-      sleep 0.5
+      sleep 1
     done
     if (( okflag==1 )); then ok "Sing-box 重启完成（OpenRC）"; return 0; fi
     warn "OpenRC 服务重启失败；切换 fallback 后台运行"
@@ -1275,16 +1236,13 @@ restart_singbox() {
   auto_optimize_cpu
   for i in $(seq 1 30); do
     _sb_any_port_listening && { ok "Sing-box 重启完成（fallback 后台）"; return 0; }
-    sleep 0.5
+    sleep 1
   done
   err "Sing-box 重启失败（fallback 也未监听），请查看 $LOG_FILE"
   return 1
 }
 
-
-# ============= 节点操作（含 NAT 端口约束） =============
 add_node() {
-  # 进入添加节点前，再次兜底确保依赖完整
   ensure_runtime_deps
 
   while true; do
@@ -1301,13 +1259,11 @@ add_node() {
     warn "无效输入，请重新输入"
   done
 
-  # ==================== 3. Hysteria2 ====================
   if [[ "$proto" == "3" ]]; then
     add_hysteria2_node || return 1
     return
   fi
 
-  # ==================== 2. VLESS-REALITY ====================
   if [[ "$proto" == "2" ]]; then
     if ! command -v sing-box >/dev/null 2>&1; then
       err "未检测到 sing-box，无法生成 Reality 密钥。请先在“脚本服务”里重装/安装。"
@@ -1345,15 +1301,14 @@ add_node() {
     else
       uuid=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/')
     fi
-    # === 修改开始：允许自定义伪装域名 ===
-read -rp "请输入伪装域名 (默认 www.microsoft.com): " input_sni
-if [[ -z "$input_sni" ]]; then
-  server_name="www.microsoft.com"
-else
-  server_name="$input_sni"
-fi
-say "已选择伪装域名: $server_name"
-# === 修改结束 ===
+
+    read -rp "请输入伪装域名 (默认 www.microsoft.com): " input_sni
+    if [[ -z "$input_sni" ]]; then
+      server_name="www.microsoft.com"
+    else
+      server_name="$input_sni"
+    fi
+    say "已选择伪装域名: $server_name"
     flow="xtls-rprx-vision"
     case $((RANDOM%5)) in 0) fp="chrome";; *) fp="firefox";; esac
     key_pair=$(sing-box generate reality-keypair 2>/dev/null)
@@ -1402,15 +1357,12 @@ say "已选择伪装域名: $server_name"
     jq --arg tag "$tag" --arg pbk "$public_key" --arg sid "$short_id" --arg sni "$server_name" --arg port "$port" --arg fp "$fp" \
       '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni, port:$port, fp:$fp}}' "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
 
-    # --- 样式优化 ---
     local link="vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=${flow}&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=${fp}#${tag}"
     local info="本地端口: ${C_CYAN}${port}${C_RESET}\nSNI域名: ${C_CYAN}${server_name}${C_RESET}\nUUID: ${C_CYAN}${uuid}${C_RESET}"
     print_card "VLESS-REALITY 搭建成功" "$tag" "$info" "$link"
-    
     return
   fi
 
-  # ==================== 4. Argo 隧道（临时 + 固定）===================
   if [[ "$proto" == "4" ]]; then
     while true; do
       say "========== Argo 隧道管理 =========="
@@ -1426,7 +1378,6 @@ say "已选择伪装域名: $server_name"
           mkdir -p "$workdir"
           rm -f "$workdir/argo.log" "$ARGO_TEMP_CACHE"
 
-          # --- 1. 智能识别节点名称 ---
           say "正在识别 IP 归属信息..."
           local api_res=$(curl -s -m 5 "http://ip-api.com/line/?fields=isp,countryCode")
           local node_name="Argo-Node"
@@ -1444,7 +1395,6 @@ say "已选择伪装域名: $server_name"
               warn "IP 信息获取超时，使用默认名称"
           fi
 
-          # --- 2. 下载核心文件 ---
           local c_cpu c_argo
           case "$(uname -m)" in
               aarch64) c_cpu="arm64-v8a"; c_argo="arm64" ;;
@@ -1474,7 +1424,6 @@ say "已选择伪装域名: $server_name"
           download_file "https://github.com/cloudflare/cloudflared/releases/download/2024.6.1/cloudflared-linux-${c_argo}" "$workdir/cloudflared"
           chmod +x "$workdir/cloudflared"
 
-          # --- 3. 生成配置与启动 ---
           local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
           if [ -z "$uuid" ]; then uuid=$(openssl rand -hex 16 | sed 's/\(..\)/\1/g; s/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/'); fi
           
@@ -1540,7 +1489,6 @@ EOF
           local vmess_link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
           echo "$vmess_link" > "$ARGO_TEMP_CACHE"
 
-          # --- 样式优化 ---
           local info="Argo 域名: ${C_CYAN}${argo_url}${C_RESET}"
           print_card "Argo 临时隧道搭建成功" "$node_name" "$info" "$vmess_link"
 
@@ -1677,7 +1625,6 @@ EOF
           fi
           import_argo_nodes && ok "固定隧道节点已添加"
           
-          # --- 样式优化 ---
           local info="隧道域名: ${C_CYAN}${agn_input}${C_RESET}\n本地端口: ${C_CYAN}${vmpt_input}${C_RESET}"
           print_card "Argo 固定隧道安装完成" "Argo-Fixed" "$info" "$vmess_link"
           
@@ -1711,7 +1658,6 @@ EOF
     return
   fi
 
-  # ==================== 1. SOCKS5（默认） ====================
   local port user pass tag tmpcfg proto_type="tcp"
   while true; do
     [[ -n "$nat_mode" ]] && {
@@ -1754,7 +1700,6 @@ EOF
     err "配置校验失败"; sing-box check -c "$CONFIG"; return 1
   fi
 
-  # --- 样式优化 ---
   local creds; creds=$(printf "%s:%s" "$user" "$pass" | base64)
   local link="socks://${creds}@${GLOBAL_IPV4}:${port}#${tag}"
   local info="本地端口: ${C_CYAN}${port}${C_RESET}\n用户名: ${C_CYAN}${user}${C_RESET}\n密码: ${C_CYAN}${pass}${C_RESET}"
@@ -1765,14 +1710,12 @@ EOF
 add_hysteria2_node() {
   ensure_runtime_deps
   
-  # --- 修改开始：支持自定义端口 ---
   local port proto_type="udp"
   
   while true; do
     read -rp "请输入 Hysteria2 端口 (留空则自动随机): " input_port
     
     if [[ -z "$input_port" ]]; then
-      # === 自动模式 (原有逻辑) ===
       say "正在自动寻找可用 UDP 端口..."
       local found_port=0
       for i in {1..10}; do
@@ -1782,7 +1725,6 @@ add_hysteria2_node() {
               return 1
           fi
           
-          # 检查占用
           if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then continue; fi
           if jq -e --argjson p "$port" 'to_entries[]? | select(.value.type=="hysteria2" and .value.port == $p)' "$META" >/dev/null 2>&1; then continue; fi
           if port_status "$port"; then continue; fi
@@ -1797,7 +1739,6 @@ add_hysteria2_node() {
       fi
       break
     else
-      # === 自定义模式 ===
       if ! [[ "$input_port" =~ ^[0-9]+$ ]] || (( input_port < 1 || input_port > 65535 )); then
           warn "端口无效，请输入 1-65535 之间的数字"
           continue
@@ -1805,13 +1746,11 @@ add_hysteria2_node() {
       
       port="$input_port"
       
-      # 检查 NAT 规则
       if ! check_nat_allow "$port" "$proto_type"; then 
          warn "该端口不符合当前的 NAT 端口规则 (协议: $proto_type)"
          continue
       fi
       
-      # 检查端口占用
       if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG" >/dev/null 2>&1; then
           warn "端口 $port 已被 Sing-box 其他节点占用"
           continue
@@ -1828,14 +1767,12 @@ add_hysteria2_node() {
       break
     fi
   done
-  # --- 修改结束 ---
   
   say "已选定端口: $port"
 
-  # 2. 安装 Hysteria 2 核心 (如果不存在)
   if ! command -v hysteria >/dev/null 2>&1; then
     say "正在安装 Hysteria 2 核心..."
-    local H_VERSION="2.6.2" # 保持稳定版本
+    local H_VERSION="2.6.2"
     local arch=$(uname -m)
     case "$arch" in
       x86_64|amd64) arch="amd64" ;;
@@ -1854,7 +1791,6 @@ add_hysteria2_node() {
     ok "Hysteria 2 安装完成"
   fi
 
-  # 3. 准备配置目录和证书
   mkdir -p /etc/hysteria2
   local cert_file="/etc/hysteria2/${port}.crt"
   local key_file="/etc/hysteria2/${port}.key"
@@ -1864,11 +1800,9 @@ add_hysteria2_node() {
   openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$key_file" -out "$cert_file" -days 3650 -subj "/CN=$sni_domain" >/dev/null 2>&1
   chmod 644 "$cert_file" "$key_file"
 
-  # 4. 生成随机密码
   local auth_pwd=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
   local obfs_pwd=$(openssl rand -base64 8 | tr -d '=+/' | cut -c1-8)
 
-  # 5. 生成配置文件
   cat > "/etc/hysteria2/${port}.yaml" <<EOF
 listen: :${port}
 
@@ -1895,7 +1829,6 @@ masquerade:
 ignoreClientBandwidth: false
 EOF
 
-  # 6. 配置 Systemd 服务
   local service_name="hysteria2-${port}"
   cat > "/etc/systemd/system/${service_name}.service" <<EOF
 [Unit]
@@ -1914,7 +1847,6 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-  # 7. 启动服务
   systemctl daemon-reload >/dev/null 2>&1
   systemctl enable "$service_name" >/dev/null 2>&1
   systemctl restart "$service_name" >/dev/null 2>&1
@@ -1925,7 +1857,6 @@ EOF
       return 1
   fi
 
-  # 8. 更新 Meta 数据
   local tag="Hy2-Default-$(date +%s)"
   local tmpmeta; tmpmeta=$(mktemp)
   trap 'rm -f "$tmpmeta"' EXIT
@@ -1934,7 +1865,6 @@ EOF
   jq --arg tag "$tag" --arg port "$port" --arg sni "$sni_domain" --arg obfs "$obfs_pwd" --arg auth "$auth_pwd" \
     '. + {($tag): {type:"hysteria2", port:$port, sni:$sni, obfs:$obfs, auth:$auth}}' "$META" >"$tmpmeta" && mv "$tmpmeta" "$META"
 
-  # 9. 输出节点链接
   local link="hysteria2://${auth_pwd}@${GLOBAL_IPV4}:${port}?obfs=salamander&obfs-password=${obfs_pwd}&sni=${sni_domain}&insecure=1#${tag}"
   local info="本地端口: ${C_CYAN}${port}${C_RESET}\nAuth密码: ${C_CYAN}${auth_pwd}${C_RESET}\nObfs密码: ${C_CYAN}${obfs_pwd}${C_RESET}\n模式: ${C_CYAN}自签证书(bing.com)${C_RESET}"
   
@@ -1949,11 +1879,9 @@ EOF
   read -rp "按回车返回主菜单..." _
 }
 
-# ===== 3. 在脚本任意位置（建议放在 add_hysteria2_node 之后）新增这个完整函数 =====
 import_argo_nodes() {
     local imported=0
 
-    # 先处理固定隧道 gd.txt（优先级高）
     if [[ -f "$ARGO_FIXED_CACHE" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
@@ -1966,7 +1894,6 @@ import_argo_nodes() {
         done < "$ARGO_FIXED_CACHE"
     fi
 
-    # 再处理临时隧道 jh.txt
     if [[ -f "$ARGO_TEMP_CACHE" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
           [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -1983,7 +1910,7 @@ import_argo_nodes() {
     return 0
 }
 view_nodes() {
-  local filter_mode="$1" # 接受参数：normal (普通) 或 argo (隧道)
+  local filter_mode="$1" 
   set +e
 
   local total ext_count
@@ -1995,8 +1922,6 @@ view_nodes() {
   declare -A node_ports node_types node_tags node_raws
   local idx=0
 
-  # ==================== 数据读取部分 ====================
-  # 1. 读取 sing-box 本地节点
   if [[ "$filter_mode" == "normal" ]]; then
     while read -r line; do
       local tag port type
@@ -2007,7 +1932,6 @@ view_nodes() {
       ((idx++))
     done < <(jq -c '.inbounds[]' "$CONFIG" 2>/dev/null)
 
-    # 2. 读取 Hysteria2 节点
     if (( ext_count > 0 )); then
       while read -r key; do
         local tag port
@@ -2019,7 +1943,6 @@ view_nodes() {
     fi
   fi
 
-  # 3. 读取 Argo 隧道节点
   if [[ "$filter_mode" == "argo" ]]; then
     local files=(); [[ -f "$ARGO_TEMP_CACHE" ]] && files+=("$ARGO_TEMP_CACHE"); [[ -f "$ARGO_FIXED_CACHE" ]] && files+=("$ARGO_FIXED_CACHE")
     for f in "${files[@]}"; do
@@ -2053,9 +1976,10 @@ view_nodes() {
     done
   fi
 
-  # ==================== 输出显示 ====================
   if (( idx == 0 )); then
     say "当前分类下暂无节点"
+    # 内存优化：清空数组
+    unset node_tags node_ports node_types node_raws
     set -e
     return
   fi
@@ -2070,11 +1994,9 @@ view_nodes() {
   echo -e "${C_GREEN}序号  协议        端口         名称${C_RESET}"
   echo "---------------------------------------------------------"
 
-  # --- 新增排序逻辑 ---
   local -a sort_map
   local k
   for ((k=0; k<idx; k++)); do
-    # 提取端口开头的数字用于排序，如果不是数字则赋大值(999999)放在最后
     local p_str="${node_ports[$k]}"
     local p_val
     if [[ "$p_str" =~ ^[0-9]+ ]]; then
@@ -2082,19 +2004,16 @@ view_nodes() {
     else
       p_val=999999
     fi
-    # 格式：端口数字:原始索引
     sort_map+=("$p_val:$k")
   done
 
-  # 按数字进行排序
   local -a sorted_indices
   IFS=$'\n' sorted_indices=($(sort -n <<<"${sort_map[*]}"))
   unset IFS
-  # -------------------
 
   local display_seq=1
   for item in "${sorted_indices[@]}"; do
-    local i="${item#*:}" # 获取原始索引
+    local i="${item#*:}" 
 
     local tag="${node_tags[$i]}"
     local port="${node_ports[$i]}"
@@ -2102,7 +2021,6 @@ view_nodes() {
     local raw="${node_raws[$i]}"
     local display_link=""
 
-    # 1. 准备链接
     if [[ "$type" == "argo" ]]; then
       display_link="$raw"
     else
@@ -2130,7 +2048,6 @@ view_nodes() {
       esac
     fi
 
-    # 2. 准备状态标识 (监听检测)
     local status_mark=""
     if [[ "$type" != "argo" ]]; then
       if [[ "$port" =~ ^[0-9]+$ ]] && ! grep -q ":$port " <<<"$ss_tcp$ss_udp" &>/dev/null; then
@@ -2138,7 +2055,6 @@ view_nodes() {
       fi
     fi
     
-    # 3. 紧凑输出
     printf "[%2d] ${C_GREEN}%-10s${C_RESET} | ${C_CYAN}%-10s${C_RESET} | ${C_CYAN}%s${C_RESET} %s\n" \
            "$display_seq" "${type^^}" "${port}" "${tag}" "${status_mark}"
     
@@ -2147,6 +2063,9 @@ view_nodes() {
     
     ((display_seq++))
   done
+  
+  # 内存优化：清空大变量
+  unset node_tags node_ports node_types node_raws sorted_indices sort_map
   set -e
 }
 
@@ -2176,7 +2095,6 @@ view_nodes_menu() {
 }
 delete_node() {
   local total ext_count real_count
-  # 计算本地节点数量 (Sing-box + Hysteria2)
   total=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo "0")
   ext_count=$(jq '[to_entries[] | select(.value.type=="hysteria2")] | length' "$META" 2>/dev/null || echo "0")
   real_count=$((total + ext_count))
@@ -2187,7 +2105,6 @@ delete_node() {
   fi
 
   say "================= 可删除的本地节点 =================="
-  # 核心修复：这里增加了 "normal" 参数，强制显示普通节点列表
   view_nodes "normal"   
   say "===================================================="
   say "提示：Argo 节点（端口为 Argo）无法在此删除"
@@ -2204,17 +2121,14 @@ delete_node() {
     read -rp "确认删除所有本地节点？(y/N): " c
     [[ "$c" != "y" && "$c" != "Y" ]] && { say "已取消"; return; }
     
-    # 清空 sing-box 入站
     jq '.inbounds = []' "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
     
-    # 清空 META (只保留 argo 类型的记录)
     if [[ -f "$META" ]]; then
         jq 'to_entries | map(select(.value.type == "argo")) | from_entries' "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
     else
         printf '{}' > "$META"
     fi
     
-    # 停止并删除所有 hysteria2 服务
     shopt -s nullglob
     for f in /etc/systemd/system/hysteria2*.service; do
       systemctl disable --now "$(basename "$f" .service)" &>/dev/null || true
@@ -2224,7 +2138,6 @@ delete_node() {
     systemctl daemon-reload &>/dev/null || true
     rm -rf /etc/hysteria2
     
-    # 重启生效
     restart_singbox >/dev/null 2>&1
     ok "所有本地节点已删除（Argo 节点不受影响）"
     return
@@ -2237,16 +2150,13 @@ delete_node() {
 
   local n=$((idx - 1))
 
-  # 判断是 sing-box 节点还是 hysteria2 节点
   if (( n < total )); then
-    # 删除 Sing-box 节点
     local tag=$(jq -r ".inbounds[$n].tag // empty" "$CONFIG")
     jq "del(.inbounds[$n])" "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
     [[ -n "$tag" && "$tag" != "null" ]] && jq "del(.\"$tag\")" "$META" > "${META}.tmp" && mv "${META}.tmp" "$META"
     restart_singbox >/dev/null 2>&1
     ok "已删除本地节点 [$idx]"
   else
-    # 删除 Hysteria2 节点
     n=$((n - total))
     local tag=$(jq -r --argjson i "$n" 'to_entries | map(select(.value.type=="hysteria2")) | .[$i].key' "$META")
     local port=$(jq -r --arg t "$tag" '.[$t].port // empty' "$META")
@@ -2262,24 +2172,18 @@ delete_node() {
   fi
 }
 is_docker() {
-  # 检查 /.dockerenv 文件（Docker 容器默认会有）
   if [ -f /.dockerenv ]; then
     return 0
   fi
-
-  # 检查 cgroup 信息（Docker 容器的 cgroup 通常包含 docker）
   if grep -qE "/docker/|/lxc/" /proc/1/cgroup 2>/dev/null; then
     return 0
   fi
-
   return 1
 }
 
-# 获取系统信息
 OS_NAME=$(lsb_release -si 2>/dev/null || grep '^ID=' /etc/os-release | cut -d= -f2)
 OS_VER=$(lsb_release -sr 2>/dev/null || grep '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
 
-# 检测 docker 并显示
 if is_docker; then
   SYSTEM_INFO="$OS_NAME（docker）"
 else
@@ -2291,7 +2195,6 @@ echo "系统: $SYSTEM_INFO"
 show_version_info() {
   local OS OS_NAME VIRT BIN OUT VER ARCH
 
-  # --- 1. 系统检测 (保持原样) ---
   OS=$(detect_os)
   [[ "$OS" == "unknown" ]] && OS_NAME="未知" || OS_NAME="${OS^}"
 
@@ -2302,8 +2205,6 @@ show_version_info() {
     OS_NAME="${OS_NAME}（docker）"
   fi
 
-  # --- 2. 增强的路径查找 (修复版本显示未知的关键) ---
-  # 优先查找常用路径，防止 command -v 在某些 sudo 环境下失效
   if [[ -x "/usr/local/bin/sing-box" ]]; then
     BIN="/usr/local/bin/sing-box"
   elif [[ -x "/usr/bin/sing-box" ]]; then
@@ -2316,17 +2217,12 @@ show_version_info() {
     BIN=""
   fi
 
-  # --- 3. 适配新版输出格式 ---
   if [[ -n "$BIN" && -x "$BIN" ]]; then
     OUT=$("$BIN" version 2>/dev/null)
     
-    # 获取版本号：匹配 "version 1.x.x"
     VER=$(echo "$OUT" | grep -oE 'version [0-9.]+(-[a-zA-Z0-9]+)?' | head -n1 | awk '{print $2}')
-    
-    # 获取架构：新版不再显示 "Environment:"，改为直接显示 "linux/amd64" 等
     ARCH=$(echo "$OUT" | grep -oE '(linux|android|darwin|windows)/(amd64|arm64|386|s390x|riscv64)' | head -n1)
     
-    # 如果没抓到架构，尝试抓取 go 版本作为替代
     if [[ -z "$ARCH" ]]; then
        ARCH=$(echo "$OUT" | grep -oE 'go[0-9.]+' | head -n1)
     fi
@@ -2336,7 +2232,7 @@ show_version_info() {
     say "Sing-box 版本: 未安装  | 架构: -     | 系统: ${OS_NAME}"
   fi
 }
-# ============= 脚本服务菜单 =============
+
 script_services_menu() {
   while true; do
     say "====== 脚本服务 ======"
@@ -2357,31 +2253,26 @@ script_services_menu() {
   done
 }
 
-# ============= 主菜单 =============
 main_menu() {
   say ""
   show_version_info
   say "============= 嘻嘻哈哈 节点管理工具（IPv4 + IPv6） ============="
   say "1) 添加节点"
-  say "2) 查看节点 (分类查看)"  # 修改了描述
+  say "2) 查看节点 (分类查看)"
   say "3) 删除节点"
   say "4) 脚本服务"
   say "5) NAT 模式设置"
   say "0) 退出"
   say "==============================================================="
-  # 在 main_menu 函数内找到 read 命令
-# 原代码：
-# read -rp "请输入操作编号: " choice
 
-# 修改为：
-if ! read -rp "请输入操作编号: " choice; then
-    echo "无法读取输入（可能是后台运行或连接断开），脚本退出。"
-    exit 1
-fi
+  if ! read -rp "请输入操作编号: " choice; then
+      echo "无法读取输入（可能是后台运行或连接断开），脚本退出。"
+      exit 1
+  fi
 
   case "$choice" in
     1) add_node ;;
-    2) view_nodes_menu ;;  # <--- 这里修改为调用新菜单
+    2) view_nodes_menu ;;
     3) delete_node ;;
     4) script_services_menu ;;
     5) nat_mode_menu ;;
@@ -2389,9 +2280,6 @@ fi
     *) warn "无效输入" ;;
   esac
 }
-
-# ============= 启动入口（终极容器版）=============
-# sb233_run_install_silent || true    <--- 注释掉这行
 
 ensure_dirs
 install_dependencies
@@ -2410,40 +2298,94 @@ case "$INIT_SYS" in
     install_logrotate
     ;;
   *)
-    # 极简容器环境：安装所有 fallback 保险
     install_singleton_wrapper
     install_autostart_fallback
     install_logrotate
-    install_watchdog_cron          # 写 cron 任务
-    start_singbox_legacy_nohup &   # 启动一次，防止要等 60 秒
+    install_watchdog_cron
+    start_singbox_legacy_nohup &
     ;;
 esac
 
-GLOBAL_IPV4=$(curl -s --max-time 2 https://api.ipify.org || echo "<服务器IP>")
-GLOBAL_IPV6=$(get_ipv6_address)
+# ==========================================
+#      🚀 增强版 IP 自动获取逻辑 (IPv4+IPv6)
+# ==========================================
+
+# --- 1. 获取 IPv4 ---
+get_public_ipv4() {
+  local ip=""
+  # 尝试多个 API，防止单点故障
+  for url in "https://api.ipify.org" "https://ifconfig.me/ip" "https://ipinfo.io/ip" "https://checkip.amazonaws.com"; do
+    ip=$(curl -s --max-time 3 "$url" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+    if [[ -n "$ip" ]]; then echo "$ip"; return 0; fi
+  done
+  return 1
+}
+
+GLOBAL_IPV4=$(get_public_ipv4)
+
+# 没获取到则强制手动输入
+if [[ -z "$GLOBAL_IPV4" ]]; then
+  echo ""
+  echo -e "\033[33m⚠️  警告：无法自动获取公网 IPv4，这会导致节点链接无法连接！\033[0m"
+  local_guess=$(ip -4 addr | grep -v '127.0.0.1' | grep -v 'docker' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+  read -rp "请输入公网 IPv4 地址 (参考: $local_guess): " manual_ip
+  GLOBAL_IPV4=${manual_ip:-$local_guess}
+fi
+
+# --- 2. 获取 IPv6 (增加过滤内网地址逻辑) ---
+get_public_ipv6() {
+  local ip=""
+  # 优先尝试外部 API (确保公网可达)
+  for url in "https://api64.ipify.org" "https://ifconfig.co/ip" "https://ipv6.icanhazip.com"; do
+    ip=$(curl -s -6 --max-time 3 "$url" | grep -Eo '([a-f0-9:]+:+)+[a-f0-9]+' | head -n1)
+    if [[ -n "$ip" ]]; then echo "$ip"; return 0; fi
+  done
+
+  # 如果 API 失败，尝试读取网卡，但必须排除 fd/fc 开头的内网地址
+  ip=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print $2}' | cut -d/ -f1 | grep -vE '^(fd|fc|fe80)' | head -n1)
+  if [[ -n "$ip" ]]; then echo "$ip"; return 0; fi
+
+  return 1
+}
+
+GLOBAL_IPV6=$(get_public_ipv6)
+
+# 如果没获取到 IPv6，询问用户是否需要手动输入
+if [[ -z "$GLOBAL_IPV6" ]]; then
+  # 看看本地有没有内网 IPv6 做参考
+  local_v6_guess=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -n1)
+  
+  # 不强制卡住，只在变量为空时尝试询问一次，用户可以直接回车跳过
+  if [[ -n "$local_v6_guess" ]]; then
+      # 如果本地有 IPv6 (可能是内网的)，为了保险起见，不自动填，怕填错
+      # 这里不做阻塞交互，避免无人值守时卡死，只在最终生成链接时如果是空就不会显示 IPv6 链接
+      : 
+  fi
+fi
+
+# 再次确认：如果用户非常需要 IPv6 且自动获取失败，可以在这里手动赋值
+# 如果您确定服务器有 IPv6 但脚本没抓到，取消下面几行的注释：
+# if [[ -z "$GLOBAL_IPV6" ]]; then
+#   echo ""
+#   read -rp "未检测到公网 IPv6，如需要请手动输入 (回车跳过): " manual_v6
+#   GLOBAL_IPV6="$manual_v6"
+# fi
+
+# ==========================================
 load_nat_data
-# === 在这里插入，脚本启动时自动执行优化 ===
 auto_optimize_cpu
-# ======================================
 trap on_int_menu_quit_only INT
 
-# ==================== 关键补丁：纯容器环境强制守护 ====================
-# 1. 尝试启动 crond（很多精简 Alpine 镜像没启动 crond）
 if command -v crond >/dev/null 2>&1; then
-    # 如果有 crond 但没跑，就启动它（这样每分钟的 watchdog 真正生效）
     pgrep crond >/dev/null || nohup crond start >/dev/null 2>&1 || crond >/dev/null 2>&1 || true
 fi
 
-# 2. 判断是否为 Docker 容器非交互启动（就是你平时 docker run 的情况）
 if [ ! -t 0 ] || [ "$AUTO_DAEMON" = "1" ]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Docker 容器环境检测到，强制拉起 sing-box 守护进程"
     /usr/local/bin/sb-singleton --force >/dev/null 2>&1
     
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box 已启动，实时日志如下（容器不会退出）"
-    # tail -f 阻塞前台，让容器永远活着
     tail -f /var/log/sing-box.log
 else
-    # 只有你手动 bash sk5.sh 或者 sh sk5.sh 时才进入交互菜单
     while true; do main_menu || break; done
 fi
-# =====================================================================
