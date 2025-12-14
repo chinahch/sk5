@@ -1239,7 +1239,7 @@ status_menu() {
          ;;
       4) 
          echo ""
-         warn "⚠️  警告：此操作将删除所有节点配置、日志及服务文件！"
+         warn "⚠️  警告：此操作将删除所有节点配置、日志、服务文件以及脚本自身！"
          read -rp "确认彻底卸载？(y/N): " confirm
          if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
              say "正在停止服务..."
@@ -1266,7 +1266,15 @@ status_menu() {
              
              systemctl daemon-reload 2>/dev/null
              
-             ok "卸载完成，脚本已清理。江湖再见！"
+             # === 新增：脚本自毁逻辑 ===
+             local self_path
+             self_path=$(readlink -f "$0") # 获取当前运行脚本的绝对路径
+             if [[ -f "$self_path" ]]; then
+                 rm -f "$self_path"
+                 say "已删除脚本文件: $self_path"
+             fi
+             
+             ok "卸载完成，江湖再见！"
              exit 0
          else
              say "已取消卸载。"
